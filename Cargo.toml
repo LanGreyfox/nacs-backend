@@ -1,0 +1,10 @@
+[package]
+name = "nacs-backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dav-server = "0.11.0"
+libp2p = "0.56.0"
+rusqlite = "0.40.1"
+tokio = "1.52.3"
