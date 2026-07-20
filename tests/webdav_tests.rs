@@ -4,7 +4,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nacs_backend::webdav::{ensure_data_dir, parse_basic_credentials};
+use hyper::{Method, StatusCode};
+use nacs_backend::webdav::{ensure_data_dir, map_to_event, parse_basic_credentials, FileEvent};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -51,4 +52,159 @@ fn parse_basic_credentials_accepts_colon_in_password() {
     let creds = parse_basic_credentials(auth).expect("credentials should parse");
     assert_eq!(creds.0, "user");
     assert_eq!(creds.1, "pa:ss");
+}
+
+// ---------------------------------------------------------------------------
+// map_to_event tests
+// ---------------------------------------------------------------------------
+
+fn uri(path: &str) -> hyper::Uri {
+    path.parse().expect("valid URI")
+}
+
+fn method(name: &str) -> Method {
+    Method::from_bytes(name.as_bytes()).expect("valid method")
+}
+
+#[test]
+fn map_to_event_put_201_is_created() {
+    assert_eq!(
+        map_to_event(&Method::PUT, StatusCode::CREATED, &uri("/file.txt"), None),
+        FileEvent::Created
+    );
+}
+
+#[test]
+fn map_to_event_put_204_is_edited() {
+    assert_eq!(
+        map_to_event(&Method::PUT, StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        FileEvent::Edited
+    );
+}
+
+#[test]
+fn map_to_event_delete_204_is_deleted() {
+    assert_eq!(
+        map_to_event(&Method::DELETE, StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        FileEvent::Deleted
+    );
+}
+
+#[test]
+fn map_to_event_move_same_dir_is_renamed() {
+    assert_eq!(
+        map_to_event(
+            &method("MOVE"),
+            StatusCode::CREATED,
+            &uri("/docs/old.txt"),
+            Some("http://localhost:4918/docs/new.txt"),
+        ),
+        FileEvent::Renamed
+    );
+}
+
+#[test]
+fn map_to_event_move_root_same_dir_is_renamed() {
+    assert_eq!(
+        map_to_event(
+            &method("MOVE"),
+            StatusCode::NO_CONTENT,
+            &uri("/old.txt"),
+            Some("http://localhost:4918/new.txt"),
+        ),
+        FileEvent::Renamed
+    );
+}
+
+#[test]
+fn map_to_event_move_different_dir_is_moved() {
+    assert_eq!(
+        map_to_event(
+            &method("MOVE"),
+            StatusCode::CREATED,
+            &uri("/docs/file.txt"),
+            Some("http://localhost:4918/archive/file.txt"),
+        ),
+        FileEvent::Moved
+    );
+}
+
+#[test]
+fn map_to_event_move_no_destination_is_moved() {
+    assert_eq!(
+        map_to_event(&method("MOVE"), StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        FileEvent::Moved
+    );
+}
+
+#[test]
+fn map_to_event_copy_201_is_copied() {
+    assert_eq!(
+        map_to_event(&method("COPY"), StatusCode::CREATED, &uri("/file.txt"), None),
+        FileEvent::Copied
+    );
+}
+
+#[test]
+fn map_to_event_mkcol_201_is_dir_created() {
+    assert_eq!(
+        map_to_event(&method("MKCOL"), StatusCode::CREATED, &uri("/newdir"), None),
+        FileEvent::DirCreated
+    );
+}
+
+#[test]
+fn map_to_event_propfind_207_is_listed() {
+    assert_eq!(
+        map_to_event(&method("PROPFIND"), StatusCode::MULTI_STATUS, &uri("/"), None),
+        FileEvent::Listed
+    );
+}
+
+#[test]
+fn map_to_event_proppatch_207_is_prop_patched() {
+    assert_eq!(
+        map_to_event(&method("PROPPATCH"), StatusCode::MULTI_STATUS, &uri("/file.txt"), None),
+        FileEvent::PropPatched
+    );
+}
+
+#[test]
+fn map_to_event_get_200_is_read() {
+    assert_eq!(
+        map_to_event(&Method::GET, StatusCode::OK, &uri("/file.txt"), None),
+        FileEvent::Read
+    );
+}
+
+#[test]
+fn map_to_event_lock_200_is_locked() {
+    assert_eq!(
+        map_to_event(&method("LOCK"), StatusCode::OK, &uri("/file.txt"), None),
+        FileEvent::Locked
+    );
+}
+
+#[test]
+fn map_to_event_unlock_204_is_unlocked() {
+    assert_eq!(
+        map_to_event(&method("UNLOCK"), StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        FileEvent::Unlocked
+    );
+}
+
+#[test]
+fn map_to_event_options_200_is_options() {
+    assert_eq!(
+        map_to_event(&Method::OPTIONS, StatusCode::OK, &uri("/"), None),
+        FileEvent::Options
+    );
+}
+
+#[test]
+fn map_to_event_put_404_is_unknown() {
+    assert_eq!(
+        map_to_event(&Method::PUT, StatusCode::NOT_FOUND, &uri("/file.txt"), None),
+        FileEvent::Unknown
+    );
 }
