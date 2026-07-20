@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nacs_backend::webdav::ensure_data_dir;
+use nacs_backend::webdav::{ensure_data_dir, parse_basic_credentials};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -29,4 +29,26 @@ async fn ensure_data_dir_creates_missing_directory() {
     assert!(dir.is_dir());
 
     fs::remove_dir_all(&dir).expect("temp dir should be removed");
+}
+
+#[test]
+fn parse_basic_credentials_accepts_case_insensitive_scheme() {
+    let auth = "bAsIc dXNlcjpwYXNz";
+    let creds = parse_basic_credentials(auth).expect("credentials should parse");
+    assert_eq!(creds.0, "user");
+    assert_eq!(creds.1, "pass");
+}
+
+#[test]
+fn parse_basic_credentials_rejects_missing_password_separator() {
+    let auth = "Basic dXNlcg==";
+    assert!(parse_basic_credentials(auth).is_none());
+}
+
+#[test]
+fn parse_basic_credentials_accepts_colon_in_password() {
+    let auth = "Basic dXNlcjpwYTpzcw==";
+    let creds = parse_basic_credentials(auth).expect("credentials should parse");
+    assert_eq!(creds.0, "user");
+    assert_eq!(creds.1, "pa:ss");
 }

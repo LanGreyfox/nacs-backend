@@ -21,7 +21,7 @@ pub fn build_handler(dir: impl AsRef<Path>) -> DavHandler {
         .build_handler()
 }
 
-fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
+pub fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
     let mut parts = value.split_whitespace();
     let scheme = parts.next()?;
     if !scheme.eq_ignore_ascii_case("basic") {
@@ -129,29 +129,4 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_basic_credentials;
 
-    #[test]
-    fn parse_basic_credentials_accepts_case_insensitive_scheme() {
-        let auth = "bAsIc dXNlcjpwYXNz";
-        let creds = parse_basic_credentials(auth).expect("credentials should parse");
-        assert_eq!(creds.0, "user");
-        assert_eq!(creds.1, "pass");
-    }
-
-    #[test]
-    fn parse_basic_credentials_rejects_missing_password_separator() {
-        let auth = "Basic dXNlcg==";
-        assert!(parse_basic_credentials(auth).is_none());
-    }
-
-    #[test]
-    fn parse_basic_credentials_accepts_colon_in_password() {
-        let auth = "Basic dXNlcjpwYTpzcw==";
-        let creds = parse_basic_credentials(auth).expect("credentials should parse");
-        assert_eq!(creds.0, "user");
-        assert_eq!(creds.1, "pa:ss");
-    }
-}
