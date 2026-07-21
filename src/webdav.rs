@@ -39,7 +39,20 @@ pub fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
     Some((username.to_string(), password.to_string()))
 }
 
-fn is_authorized(headers: &HeaderMap, expected_user: &str, expected_pass: &str) -> bool {
+fn method_allows_unauthenticated(method: &Method) -> bool {
+    method.as_str() == "OPTIONS"
+}
+
+fn is_authorized(
+    headers: &HeaderMap,
+    expected_user: &str,
+    expected_pass: &str,
+    method: &Method,
+) -> bool {
+    if method_allows_unauthenticated(method) {
+        return true;
+    }
+
     headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -275,7 +288,7 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
                                     .and_then(|v| v.to_str().ok())
                                     .map(|s| s.to_string());
 
-                                let authorized = is_authorized(req.headers(), &username, &password);
+                                let authorized = is_authorized(req.headers(), &username, &password, &method);
 
                                 if !authorized {
                                     let auth_reason = match req

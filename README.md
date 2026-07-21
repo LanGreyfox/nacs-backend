@@ -25,6 +25,8 @@ This server enforces HTTP Basic Authentication. Credentials are read from enviro
 
 The server expects the environment variables to be set; it will exit with an error if they are missing.
 
+The server also allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
+
 ## Build & Run
 
 Set your credentials and start the server:
