@@ -209,6 +209,30 @@ pub fn log_file_event(
     }
 }
 
+pub fn build_unauthorized_response(method: &Method) -> Response<Body> {
+    // Dolphin/KIO expects a strict challenge response and
+    // benefits from DAV capability headers on preflight OPTIONS.
+    let mut builder = Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            WWW_AUTHENTICATE,
+            "Basic realm=\"webdav\", charset=\"UTF-8\"",
+        )
+        .header(CONTENT_LENGTH, "0");
+
+    if method.as_str() == "OPTIONS" {
+        builder = builder
+            .header("DAV", "1,2")
+            .header("MS-Author-Via", "DAV")
+            .header(
+                "Allow",
+                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+            );
+    }
+
+    builder.body(Body::empty()).unwrap()
+}
+
 pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<()> {
     ensure_data_dir(dir.as_ref()).await?;
     // Read credentials from environment
@@ -270,27 +294,7 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
                                         method, uri
                                     );
 
-                                    // Dolphin/KIO expects a strict challenge response and
-                                    // benefits from DAV capability headers on preflight OPTIONS.
-                                    let mut builder = Response::builder()
-                                        .status(StatusCode::UNAUTHORIZED)
-                                        .header(
-                                            WWW_AUTHENTICATE,
-                                            "Basic realm=\"webdav\", charset=\"UTF-8\"",
-                                        )
-                                        .header(CONTENT_LENGTH, "0");
-
-                                    if method.as_str() == "OPTIONS" {
-                                        builder = builder
-                                            .header("DAV", "1,2")
-                                            .header("MS-Author-Via", "DAV")
-                                            .header(
-                                                "Allow",
-                                                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK",
-                                            );
-                                    }
-
-                                    let resp = builder.body(Body::empty()).unwrap();
+                                    let resp = build_unauthorized_response(&method);
                                     return Ok::<_, Infallible>(resp);
                                 }
 

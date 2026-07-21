@@ -5,7 +5,9 @@ use std::{
 };
 
 use hyper::{Method, StatusCode};
-use nacs_backend::webdav::{ensure_data_dir, map_to_event, parse_basic_credentials, FileEvent};
+use nacs_backend::webdav::{
+    build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials, FileEvent,
+};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -206,5 +208,54 @@ fn map_to_event_put_404_is_unknown() {
     assert_eq!(
         map_to_event(&Method::PUT, StatusCode::NOT_FOUND, &uri("/file.txt"), None),
         FileEvent::Unknown
+    );
+}
+
+#[test]
+fn unauthorized_response_includes_basic_challenge_and_content_length() {
+    let response = build_unauthorized_response(&method("PROPFIND"));
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Basic realm=\"webdav\", charset=\"UTF-8\"")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+}
+
+#[test]
+fn unauthorized_options_response_includes_dav_capability_headers() {
+    let response = build_unauthorized_response(&Method::OPTIONS);
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get("DAV")
+            .and_then(|v| v.to_str().ok()),
+        Some("1,2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("MS-Author-Via")
+            .and_then(|v| v.to_str().ok()),
+        Some("DAV")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("Allow")
+            .and_then(|v| v.to_str().ok()),
+        Some("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK")
     );
 }
