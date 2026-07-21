@@ -3,7 +3,7 @@ use std::{convert::Infallible, io, net::SocketAddr, path::Path};
 use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
 use dav_server::body::Body;
 use hyper::{header::HeaderMap, server::conn::http1, service::service_fn, Method, Response, StatusCode, Uri};
-use hyper::header::{AUTHORIZATION, USER_AGENT};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, USER_AGENT, WWW_AUTHENTICATE};
 // use dav_server::Body for response bodies (imported above)
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -270,11 +270,27 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
                                         method, uri
                                     );
 
-                                    let resp = Response::builder()
+                                    // Dolphin/KIO expects a strict challenge response and
+                                    // benefits from DAV capability headers on preflight OPTIONS.
+                                    let mut builder = Response::builder()
                                         .status(StatusCode::UNAUTHORIZED)
-                                        .header("WWW-Authenticate", "Basic realm=\"webdav\"")
-                                        .body(Body::empty())
-                                        .unwrap();
+                                        .header(
+                                            WWW_AUTHENTICATE,
+                                            "Basic realm=\"webdav\", charset=\"UTF-8\"",
+                                        )
+                                        .header(CONTENT_LENGTH, "0");
+
+                                    if method.as_str() == "OPTIONS" {
+                                        builder = builder
+                                            .header("DAV", "1,2")
+                                            .header("MS-Author-Via", "DAV")
+                                            .header(
+                                                "Allow",
+                                                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+                                            );
+                                    }
+
+                                    let resp = builder.body(Body::empty()).unwrap();
                                     return Ok::<_, Infallible>(resp);
                                 }
 
