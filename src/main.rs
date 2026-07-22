@@ -1,10 +1,17 @@
-mod webdav;
-
 use std::net::SocketAddr;
+
+use nacs_backend::{db, webdav};
 
 #[tokio::main]
 async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Failed to start WebDAV server: {err}");
+    }
+}
+
+async fn run() -> std::io::Result<()> {
     let dir = "./data";
+    let sqlite_dir = "./sqlite";
     let host = std::env::var("WEBDAV_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("WEBDAV_PORT")
         .ok()
@@ -14,7 +21,6 @@ async fn main() {
         .parse()
         .expect("Invalid WEBDAV_HOST/WEBDAV_PORT combination");
 
-    if let Err(err) = webdav::run_server(addr, dir).await {
-        eprintln!("Failed to start WebDAV server: {err}");
-    }
+    let database = db::Database::open(sqlite_dir).await?;
+    webdav::run_server(addr, dir, database).await
 }

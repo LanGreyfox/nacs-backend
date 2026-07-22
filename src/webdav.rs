@@ -1,5 +1,6 @@
 use std::{convert::Infallible, io, net::SocketAddr, path::Path};
 
+use crate::db::{Database, EventEnvelope, EventKind};
 use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
 use dav_server::body::Body;
 use hyper::{header::HeaderMap, server::conn::http1, service::service_fn, Method, Response, StatusCode, Uri};
@@ -246,7 +247,20 @@ pub fn build_unauthorized_response(method: &Method) -> Response<Body> {
     builder.body(Body::empty()).unwrap()
 }
 
-pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<()> {
+fn event_kind_for_storage(event: &FileEvent) -> Option<EventKind> {
+    match event {
+        FileEvent::Created => Some(EventKind::Created),
+        FileEvent::Edited => Some(EventKind::Edited),
+        FileEvent::Deleted => Some(EventKind::Deleted),
+        FileEvent::Renamed => Some(EventKind::Renamed),
+        FileEvent::Moved => Some(EventKind::Moved),
+        FileEvent::Copied => Some(EventKind::Copied),
+        FileEvent::DirCreated => Some(EventKind::DirCreated),
+        _ => None,
+    }
+}
+
+pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Database) -> io::Result<()> {
     ensure_data_dir(dir.as_ref()).await?;
     // Read credentials from environment
     let username = std::env::var("WEBDAV_USER").expect("WEBDAV_USER must be set");
@@ -260,6 +274,7 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
     loop {
         let (stream, _) = listener.accept().await?;
         let dav_server = dav_server.clone();
+        let database = database.clone();
         let username = username.clone();
         let password = password.clone();
         let io = TokioIo::new(stream);
@@ -273,6 +288,7 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
                             let dav_server = dav_server.clone();
                             let username = username.clone();
                             let password = password.clone();
+                            let database = database.clone();
                             async move {
                                 let method = req.method().clone();
                                 let uri = req.uri().clone();
@@ -314,6 +330,16 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>) -> io::Result<(
                                 let response = dav_server.handle(req).await;
                                 let status = response.status();
                                 let event = map_to_event(&method, status, &uri, destination.as_deref());
+                                if let Some(event_kind) = event_kind_for_storage(&event) {
+                                    database.record(EventEnvelope {
+                                        event_kind,
+                                        source_path: uri.path().to_string(),
+                                        destination_path: destination.clone(),
+                                        method: method.as_str().to_string(),
+                                        status_code: status.as_u16(),
+                                        username: username.clone(),
+                                    });
+                                }
                                 log_file_event(&event, &method, &uri, status, &user_agent);
 
                                 Ok::<_, Infallible>(response)
