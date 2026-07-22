@@ -260,11 +260,20 @@ fn event_kind_for_storage(event: &FileEvent) -> Option<EventKind> {
     }
 }
 
+fn required_env_var(name: &str) -> io::Result<String> {
+    std::env::var(name).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Missing required environment variable {name}: {err}"),
+        )
+    })
+}
+
 pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Database) -> io::Result<()> {
     ensure_data_dir(dir.as_ref()).await?;
     // Read credentials from environment
-    let username = std::env::var("WEBDAV_USER").expect("WEBDAV_USER must be set");
-    let password = std::env::var("WEBDAV_PASS").expect("WEBDAV_PASS must be set");
+    let username = required_env_var("WEBDAV_USER")?;
+    let password = required_env_var("WEBDAV_PASS")?;
 
     let dav_server = build_handler(dir.as_ref());
     let listener = TcpListener::bind(addr).await?;
