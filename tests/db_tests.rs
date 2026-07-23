@@ -50,8 +50,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-async fn open_database(base_dir: &Path) -> Database {
-    Database::open(base_dir)
+async fn open_database(sqlite_dir: &Path, data_dir: &Path) -> Database {
+    Database::open(sqlite_dir, data_dir)
         .await
         .expect("database should open")
 }
@@ -61,7 +61,7 @@ async fn database_open_creates_sqlite_file_and_tables() {
     let base_dir = temp_dir("db-open");
     let sqlite_path = base_dir.join("webdav.db");
 
-    let _database = open_database(&base_dir).await;
+    let _database = open_database(&base_dir, &base_dir).await;
 
     wait_for_condition(Duration::from_secs(2), || sqlite_path.exists());
 
@@ -90,10 +90,10 @@ async fn record_created_event_persists_resource_and_event() {
     let mut file = fs::File::create(&file_path).expect("test file should be created");
     file.write_all(content).expect("test file should be writable");
 
-    let database = open_database(&base_dir).await;
+    let database = open_database(&base_dir, &base_dir).await;
     database.record(EventEnvelope {
         event_kind: EventKind::Created,
-        source_path: file_path.to_string_lossy().to_string(),
+        source_path: "/note.txt".to_string(),
         destination_path: None,
         method: "PUT".to_string(),
         status_code: 201,
@@ -122,19 +122,19 @@ async fn record_created_event_persists_resource_and_event() {
     let (resource_kind, current_folder, checksum): (String, String, Option<String>) = conn
         .query_row(
             "SELECT resource_kind, current_folder, checksum FROM resources WHERE resource_path = ?1",
-            [file_path.to_string_lossy().to_string()],
+            ["/note.txt"],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("resource row should exist");
 
     assert_eq!(resource_kind, "file");
-    assert_eq!(current_folder, base_dir.to_string_lossy());
+    assert_eq!(current_folder, "/");
     assert_eq!(checksum.as_deref(), Some(expected_checksum.as_str()));
 
     let (event_type, event_resource_kind, method, status_code): (String, String, String, i64) = conn
         .query_row(
             "SELECT event_type, resource_kind, method, status_code FROM events WHERE source_path = ?1",
-            [file_path.to_string_lossy().to_string()],
+            ["/note.txt"],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("event row should exist");
@@ -156,10 +156,10 @@ async fn record_deleted_event_archives_resource_and_removes_active_row() {
     fs::create_dir_all(&base_dir).expect("temp dir should exist");
     fs::write(&file_path, b"to be removed").expect("test file should be created");
 
-    let database = open_database(&base_dir).await;
+    let database = open_database(&base_dir, &base_dir).await;
     database.record(EventEnvelope {
         event_kind: EventKind::Created,
-        source_path: file_path.to_string_lossy().to_string(),
+        source_path: "/old.txt".to_string(),
         destination_path: None,
         method: "PUT".to_string(),
         status_code: 201,
@@ -182,7 +182,7 @@ async fn record_deleted_event_archives_resource_and_removes_active_row() {
 
     database.record(EventEnvelope {
         event_kind: EventKind::Deleted,
-        source_path: file_path.to_string_lossy().to_string(),
+        source_path: "/old.txt".to_string(),
         destination_path: None,
         method: "DELETE".to_string(),
         status_code: 204,
@@ -212,7 +212,7 @@ async fn record_deleted_event_archives_resource_and_removes_active_row() {
     let archived_checksum: Option<String> = conn
         .query_row(
             "SELECT checksum FROM resource_archive WHERE resource_path = ?1",
-            [file_path.to_string_lossy().to_string()],
+            ["/old.txt"],
             |row| row.get(0),
         )
         .expect("archive row should exist");
@@ -220,4 +220,57 @@ async fn record_deleted_event_archives_resource_and_removes_active_row() {
     assert!(archived_checksum.is_some());
 
     fs::remove_dir_all(&base_dir).expect("temp dir should be removed");
+}
+
+#[tokio::test]
+async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
+    let sqlite_dir = temp_dir("db-checksum-sqlite");
+    let data_dir = temp_dir("db-checksum-data");
+    let sqlite_path = sqlite_dir.join("webdav.db");
+    let content = b"checksum test content";
+
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    let mut file = fs::File::create(data_dir.join("report.txt")).expect("test file should be created");
+    file.write_all(content).expect("test file should be writable");
+
+    let database = open_database(&sqlite_dir, &data_dir).await;
+    database.record(EventEnvelope {
+        event_kind: EventKind::Created,
+        source_path: "/report.txt".to_string(),
+        destination_path: None,
+        method: "PUT".to_string(),
+        status_code: 201,
+        username: "bob".to_string(),
+    });
+
+    let expected_checksum = sha256_hex(content);
+
+    wait_for_condition(Duration::from_secs(2), || {
+        if !sqlite_path.exists() {
+            return false;
+        }
+        let conn = open_conn(&sqlite_path);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .expect("should query resource count");
+        count == 1
+    });
+
+    let conn = open_conn(&sqlite_path);
+    let checksum: Option<String> = conn
+        .query_row(
+            "SELECT checksum FROM resources WHERE resource_path = ?1",
+            ["/report.txt"],
+            |row| row.get(0),
+        )
+        .expect("resource row should exist");
+
+    assert_eq!(
+        checksum.as_deref(),
+        Some(expected_checksum.as_str()),
+        "checksum must be computed from data_dir/report.txt, not the raw WebDAV path"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).expect("sqlite temp dir should be removed");
+    fs::remove_dir_all(&data_dir).expect("data temp dir should be removed");
 }

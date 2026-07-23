@@ -82,15 +82,16 @@ enum Command {
 }
 
 impl Database {
-    pub async fn open(base_dir: impl AsRef<Path>) -> io::Result<Self> {
+    pub async fn open(base_dir: impl AsRef<Path>, data_dir: impl AsRef<Path>) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
+        let data_dir = data_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&base_dir).await?;
 
         let db_path = base_dir.join(DB_FILENAME);
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        thread::spawn(move || run_worker(db_path, rx, ready_tx));
+        thread::spawn(move || run_worker(db_path, data_dir, rx, ready_tx));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self { tx }),
@@ -106,6 +107,7 @@ impl Database {
 
 fn run_worker(
     db_path: PathBuf,
+    data_dir: PathBuf,
     mut rx: mpsc::UnboundedReceiver<Command>,
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
@@ -127,7 +129,7 @@ fn run_worker(
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::Record(event) => {
-                if let Err(err) = apply_event(&mut conn, event) {
+                if let Err(err) = apply_event(&mut conn, &data_dir, event) {
                     eprintln!("failed to persist webdav event: {err}");
                 }
             }
@@ -206,7 +208,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn apply_event(conn: &mut Connection, event: EventEnvelope) -> rusqlite::Result<()> {
+fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     let source_path = normalize_path(&event.source_path);
     let destination_path = event.destination_path.as_deref().map(normalize_path);
@@ -220,7 +222,7 @@ fn apply_event(conn: &mut Connection, event: EventEnvelope) -> rusqlite::Result<
     let mut checksum = if resource_kind == ResourceKind::Folder {
         None
     } else {
-        compute_checksum(&final_path).ok().flatten()
+        compute_checksum(data_dir, &final_path).ok().flatten()
     };
 
     let mut archive_resource_id = None;
@@ -489,8 +491,10 @@ fn resolve_resource_kind(event_kind: EventKind, existing: Option<&ResourceRow>) 
         })
 }
 
-fn compute_checksum(path: &str) -> io::Result<Option<String>> {
-    let mut file = fs::File::open(path)?;
+fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<String>> {
+    let rel = webdav_path.trim_start_matches('/');
+    let fs_path = data_dir.join(rel);
+    let mut file = fs::File::open(&fs_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
 

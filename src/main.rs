@@ -21,6 +21,6 @@ async fn run() -> std::io::Result<()> {
         .parse()
         .expect("Invalid WEBDAV_HOST/WEBDAV_PORT combination");
 
-    let database = db::Database::open(sqlite_dir).await?;
+    let database = db::Database::open(sqlite_dir, dir).await?;
     webdav::run_server(addr, dir, database).await
 }
