@@ -19,15 +19,18 @@ The server also persists WebDAV file events to SQLite through a background worke
 ## Default configuration
 
 - Default listening address: `127.0.0.1:4918`
+- Default P2P listening port: `4001`
 - Data directory: `./data` (created automatically)
 - SQLite directory: `./sqlite` (created automatically)
 
 The SQLite database file is stored as `./sqlite/webdav.db`.
+The persistent P2P identity key is stored as `./sqlite/p2p_identity.key`.
 
 You can override host and port with environment variables:
 
 - `WEBDAV_HOST` — bind host/IP (default: `127.0.0.1`)
 - `WEBDAV_PORT` — bind port (default: `4918`)
+- `P2P_PORT` — libp2p listen port (default: `4001`)
 
 ## Authentication
 
@@ -61,8 +64,39 @@ export WEBDAV_USER="youruser"
 export WEBDAV_PASS="yourpassword"
 export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
+export P2P_PORT="4001"
 cargo run
 ```
+
+If `P2P_PORT` is not set, the application listens on `4001`.
+
+## Multi-instance example (3 nodes)
+
+Start three instances in separate terminals so each node has unique WebDAV and P2P ports:
+
+Terminal 1:
+
+```bash
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" cargo run
+```
+
+Terminal 2:
+
+```bash
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" cargo run
+```
+
+Terminal 3:
+
+```bash
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" cargo run
+```
+
+Expected behavior:
+
+- Every instance logs its own peer ID (`p2p node started: ...`).
+- Every instance logs discovered peers (`new node discovered: <peer_id>`).
+- With one single instance running, discovery stays idle without errors (0 neighbors).
 
 On first start the application creates `./sqlite/webdav.db` automatically.
 On later starts, the existing database is reused.

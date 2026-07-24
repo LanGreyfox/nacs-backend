@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use nacs_backend::{db, webdav};
+use nacs_backend::{db, p2p, webdav};
 
 #[tokio::main]
 async fn main() {
@@ -22,5 +22,12 @@ async fn run() -> std::io::Result<()> {
         .expect("Invalid WEBDAV_HOST/WEBDAV_PORT combination");
 
     let database = db::Database::open(sqlite_dir, dir).await?;
+
+    tokio::spawn(async move {
+        if let Err(err) = p2p::run_discovery(sqlite_dir).await {
+            eprintln!("p2p discovery stopped: {err}");
+        }
+    });
+
     webdav::run_server(addr, dir, database).await
 }
