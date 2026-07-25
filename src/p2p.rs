@@ -20,6 +20,7 @@ const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 120;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
@@ -56,6 +57,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
             Ok(DiscoveryBehaviour { mdns, ping })
         })
         .map_err(io::Error::other)?
+        .with_swarm_config(|cfg| {
+            cfg.with_idle_connection_timeout(Duration::from_secs(IDLE_CONNECTION_TIMEOUT_SECS))
+        })
         .build();
 
     swarm
