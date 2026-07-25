@@ -74,13 +74,18 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                 for (peer_id, peer_addr) in peers {
+                    if peer_id == local_peer_id {
+                        continue;
+                    }
+
                     if seen_peers.insert(peer_id) {
                         println!("new node discovered: {peer_id} at {peer_addr}");
-                        match swarm.dial(peer_addr.clone()) {
-                            Ok(()) => println!("dialing peer: {peer_id} via {peer_addr}"),
+                        match swarm.dial(peer_id) {
+                            // Dial by peer id lets mDNS provide/refresh usable addresses.
+                            Ok(()) => println!("dialing peer: {peer_id} (discovered at {peer_addr})"),
                             Err(err) => {
                                 seen_peers.remove(&peer_id);
-                                eprintln!("failed to dial discovered peer {peer_id} via {peer_addr}: {err}");
+                                eprintln!("failed to dial discovered peer {peer_id}: {err}");
                             }
                         }
                     }
