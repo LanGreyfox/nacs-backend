@@ -51,3 +51,17 @@ fn discovery_filter_reports_each_peer_once() {
     let second_batch = newly_discovered_peers(&mut seen, vec![p1, p2]);
     assert!(second_batch.is_empty());
 }
+
+#[test]
+fn discovery_filter_reports_peer_again_after_removal() {
+    let mut seen = HashSet::new();
+    let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+    let first_batch = newly_discovered_peers(&mut seen, vec![peer]);
+    assert_eq!(first_batch, vec![peer]);
+
+    assert!(seen.remove(&peer));
+
+    let rediscovered_batch = newly_discovered_peers(&mut seen, vec![peer]);
+    assert_eq!(rediscovered_batch, vec![peer]);
+}
