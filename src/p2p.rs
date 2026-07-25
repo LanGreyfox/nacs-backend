@@ -73,10 +73,17 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                 println!("p2p listening on {address}");
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-                for peer_id in
-                    newly_discovered_peers(&mut seen_peers, peers.into_iter().map(|(peer_id, _)| peer_id))
-                {
-                    println!("new node discovered: {peer_id}");
+                for (peer_id, peer_addr) in peers {
+                    if seen_peers.insert(peer_id) {
+                        println!("new node discovered: {peer_id} at {peer_addr}");
+                        match swarm.dial(peer_addr.clone()) {
+                            Ok(()) => println!("dialing peer: {peer_id} via {peer_addr}"),
+                            Err(err) => {
+                                seen_peers.remove(&peer_id);
+                                eprintln!("failed to dial discovered peer {peer_id} via {peer_addr}: {err}");
+                            }
+                        }
+                    }
                 }
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -108,6 +115,24 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                     None => eprintln!("peer disconnected: {peer_id}"),
                 }
             }
+            SwarmEvent::Dialing { peer_id, .. } => match peer_id {
+                Some(peer_id) => println!("dial started: {peer_id}"),
+                None => println!("dial started: unknown peer"),
+            },
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                endpoint,
+                ..
+            } => {
+                println!("peer connected: {peer_id} via {endpoint:?}");
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
+                Some(peer_id) => {
+                    seen_peers.remove(&peer_id);
+                    eprintln!("outgoing dial failed for {peer_id}: {error}");
+                }
+                None => eprintln!("outgoing dial failed for unknown peer: {error}"),
+            },
             _ => {}
         }
     }
