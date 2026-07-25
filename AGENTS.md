@@ -5,7 +5,7 @@
 |-----------|-------|
 | **Language** | Rust |
 | **Version** | 0.1.0 |
-| **Primary Function** | WebDAV Server based on `dav-server` framework |
+| **Primary Function** | WebDAV Server with P2P Discovery based on `dav-server` and `libp2p` |
 
 ---
 
@@ -14,10 +14,14 @@
 ├── src/
 │   ├── main.rs              # Binary entry point and startup wiring
 │   ├── db.rs                # SQLite persistence layer and background worker
-│   └── webdav.rs            # WebDAV server implementation
+│   ├── webdav.rs            # WebDAV server implementation
+│   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
+│   ├── lib.rs               # Library exports and shared functionality
+│   └── p2p.rs               # P2P discovery and peer communication
 ├── tests/
 │   ├── webdav_tests.rs      # WebDAV helper tests
-│   └── db_tests.rs          # SQLite persistence integration tests
+│   ├── db_tests.rs          # SQLite persistence integration tests
+│   └── p2p_tests.rs         # P2P discovery and peer tests
 ├── Cargo.toml               # Dependencies & package configuration
 ├── AGENTS.md                # Agent project information ✅
 ├── data/                    # WebDAV storage directory (auto-created)
@@ -34,7 +38,7 @@
 | `dav-server` | 0.11.0 | WebDAV Server implementation |
 | `tokio` | 1.52.3 | Async runtime (full features) |
 | `hyper` | 1.10.1 | HTTP/Server layer |
-| `libp2p` | 0.56.0 | Peer-to-peer communication (optional) |
+| `libp2p` | 0.56.0 | Peer-to-peer communication and discovery |
 | `rusqlite` | 0.40.1 | SQLite database support |
 | `sha2` | 0.10 | SHA-256 checksum calculation |
 
@@ -42,11 +46,15 @@
 
 ## ⚙️ Configuration Summary
 ```
-✅ Default Port: http://127.0.0.1:4918
+✅ Default WebDAV Port: http://127.0.0.1:4918
+✅ Default P2P Port: 4001
 ✅ Data Directory: ./data (auto-created)
 ✅ SQLite Directory: ./sqlite (auto-created)
 ✅ SQLite File: ./sqlite/webdav.db
+✅ P2P Identity File: ./p2p_identity.key (auto-created)
 ✅ Lock System: FakeLs (for simple tests)
+✅ P2P Discovery: mDNS-based peer discovery
+✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ```
 
 ---
@@ -57,17 +65,24 @@
 - [x] Async event loop with Tokio
 - [x] Auto-creation of data directories
 - [x] SQLite persistence with background worker
+- [x] P2P peer discovery with libp2p (mDNS)
+- [x] Encrypted P2P transport (Noise + Yamux)
+- [x] P2P identity management and persistence
 - [x] Integration tests in `tests/db_tests.rs`
+- [x] P2P discovery tests in `tests/p2p_tests.rs`
 - [ ] Prepared SQL statements in `src/main.rs`
+- [ ] P2P content replication between peers
 
 ---
 
 ## 🔍 Typical Optimizations (Priority Order)
-1. **Error Handling** – Improve error logging with context
+1. **P2P Content Replication** – Sync files across peers via P2P network
 2. **Connection Pooling** – For SQLite database, if concurrency grows beyond the current single-worker model
-3. **Authentication** – Add JWT or Basic Auth
-4. **Configuration Externalization** – With `.env` file
-5. **Health Checks** – Implement `/health` endpoint
+3. **Error Handling** – Improve error logging with context
+4. **Authentication** – Add JWT or Basic Auth to WebDAV and P2P
+5. **Configuration Externalization** – With `.env` file for ports and paths
+6. **Health Checks** – Implement `/health` endpoint
+7. **P2P Event Broadcasting** – Notify peers of file changes in real-time
 
 ---
 
@@ -91,6 +106,26 @@ webdav::run_server(addr, "./data", database).await?;
 The WebDAV layer sends events to a background SQLite worker via `mpsc`.
 The worker stores current resources, archived resources, and the event history.
 
+### P2P Peer Discovery
+```rust
+// mDNS-based peer discovery with libp2p
+pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
+    let local_key = load_or_create_identity(&key_path).await?;
+    let local_peer_id = PeerId::from(local_key.public());
+    let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+        .with_behaviour(|key| mdns::tokio::Behaviour::new(...))
+        .build();
+    // Listen for peer discovery events via `swarm.select_next_some()` loop
+}
+```
+
+**P2P Features:**
+- **Transport:** TCP with Noise encryption + Yamux multiplexing
+- **Discovery:** mDNS for automatic peer detection on LAN
+- **Identity:** Persistent peer identity stored in `p2p_identity.key`
+- **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
+
 ---
 
 ## 🛠️ Common Actions for Agents
@@ -101,7 +136,9 @@ The worker stores current resources, archived resources, and the event history.
 | **Run** | `cargo run` or `target/release/nacs-backend` |
 | **Tests** | `cargo test` |
 | **DB tests** | `cargo test --test db_tests` |
-| **Optimize** | Code refactoring, performance tuning |
+| **P2P tests** | `cargo test --test p2p_tests` |
+| **All tests** | `cargo test --all` |
+| **Set P2P Port** | `P2P_PORT=5001 cargo run` |
 
 ---
 
@@ -117,8 +154,9 @@ The worker stores current resources, archived resources, and the event history.
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026 |
+| **Last Updated** | 2026-07-25 (P2P feature added) |
 | **Status** | ✅ Active project info for future interactions |
+| **P2P Status** | ✅ Peer discovery and mDNS implemented |
 
 ---
 
