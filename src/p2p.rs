@@ -1,18 +1,28 @@
 use std::{
     collections::HashSet,
+    convert::Infallible,
     error::Error,
     io,
     path::{Path, PathBuf},
+    task::{Context, Poll},
     time::Duration,
 };
 
 use libp2p::{
+    core::{transport::PortUse, upgrade::DeniedUpgrade, Endpoint, Multiaddr},
     futures::StreamExt,
     identity,
     mdns,
     noise,
     ping,
-    swarm::SwarmEvent,
+    swarm::{
+        behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
+        ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent,
+        ConnectionId, SwarmEvent,
+        THandler, THandlerInEvent, THandlerOutEvent,
+        handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
+        StreamUpgradeError, SubstreamProtocol,
+    },
     tcp, yamux, PeerId, SwarmBuilder,
 };
 
@@ -26,8 +36,112 @@ const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
+    keep_alive: KeepAliveBehaviour,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
+}
+
+// In libp2p 0.56, ping streams are intentionally ignored for keep-alive.
+// This no-op behaviour keeps established connections alive while ping still
+// provides liveness checks.
+struct KeepAliveBehaviour;
+
+impl NetworkBehaviour for KeepAliveBehaviour {
+    type ConnectionHandler = KeepAliveConnectionHandler;
+    type ToSwarm = Infallible;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(KeepAliveConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: Endpoint,
+        _: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(KeepAliveConnectionHandler)
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: PeerId,
+        _: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
+        libp2p::core::util::unreachable(event)
+    }
+
+    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        Poll::Pending
+    }
+
+    fn on_swarm_event(&mut self, _event: FromSwarm) {}
+}
+
+#[derive(Clone)]
+struct KeepAliveConnectionHandler;
+
+impl ConnectionHandler for KeepAliveConnectionHandler {
+    type FromBehaviour = Infallible;
+    type ToBehaviour = Infallible;
+    type InboundProtocol = DeniedUpgrade;
+    type OutboundProtocol = DeniedUpgrade;
+    type InboundOpenInfo = ();
+    type OutboundOpenInfo = ();
+
+    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
+        SubstreamProtocol::new(DeniedUpgrade, ())
+    }
+
+    fn connection_keep_alive(&self) -> bool {
+        true
+    }
+
+    fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
+        libp2p::core::util::unreachable(event)
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut Context<'_>,
+    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>> {
+        Poll::Pending
+    }
+
+    fn on_connection_event(
+        &mut self,
+        event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol>,
+    ) {
+        match event {
+            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound { protocol, .. }) => {
+                libp2p::core::util::unreachable(protocol)
+            }
+            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound { protocol, .. }) => {
+                libp2p::core::util::unreachable(protocol)
+            }
+            ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => match error {
+                StreamUpgradeError::Timeout => unreachable!(),
+                StreamUpgradeError::Apply(e) => libp2p::core::util::unreachable(e),
+                StreamUpgradeError::NegotiationFailed | StreamUpgradeError::Io(_) => {
+                    unreachable!("Denied upgrade does not support any protocols")
+                }
+            },
+            ConnectionEvent::AddressChange(_)
+            | ConnectionEvent::ListenUpgradeError(_)
+            | ConnectionEvent::LocalProtocolsChange(_)
+            | ConnectionEvent::RemoteProtocolsChange(_) => {}
+            _ => {}
+        }
+    }
 }
 
 pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
@@ -48,6 +162,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
         .map_err(io::Error::other)?
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
+            let keep_alive = KeepAliveBehaviour;
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
                 .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
             let ping = ping::Behaviour::new(
@@ -56,7 +171,11 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                     .with_timeout(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)),
             );
 
-            Ok(DiscoveryBehaviour { mdns, ping })
+            Ok(DiscoveryBehaviour {
+                keep_alive,
+                mdns,
+                ping,
+            })
         })
         .map_err(io::Error::other)?
         .with_swarm_config(|cfg| {
@@ -73,6 +192,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     let mut seen_peers = HashSet::new();
+    let mut connected_peers = HashSet::new();
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -81,6 +201,11 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                 for (peer_id, peer_addr) in peers {
                     if peer_id == local_peer_id {
+                        continue;
+                    }
+
+                    if connected_peers.contains(&peer_id) {
+                        seen_peers.insert(peer_id);
                         continue;
                     }
 
@@ -99,6 +224,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
             }
             SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                 for (peer_id, _) in peers {
+                    connected_peers.remove(&peer_id);
                     if seen_peers.remove(&peer_id) {
                         eprintln!("peer no longer discoverable: {peer_id}");
                     }
@@ -110,6 +236,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                         println!("heartbeat ok: {peer} rtt={rtt:?}");
                     }
                     Err(err) => {
+                        connected_peers.remove(&peer);
                         seen_peers.remove(&peer);
                         eprintln!("peer unreachable (heartbeat failed): {peer}: {err}");
                     }
@@ -120,9 +247,17 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                 cause,
                 ..
             } => {
+                connected_peers.remove(&peer_id);
                 seen_peers.remove(&peer_id);
                 match cause {
-                    Some(err) => eprintln!("peer disconnected: {peer_id} ({err})"),
+                    Some(ConnectionError::KeepAliveTimeout) => {
+                        eprintln!(
+                            "peer disconnected: {peer_id} (keepalive timeout expired - no protocol requested connection keep-alive)"
+                        )
+                    }
+                    Some(ConnectionError::IO(err)) => {
+                        eprintln!("peer disconnected: {peer_id} (I/O error: {err})")
+                    }
                     None => eprintln!("peer disconnected: {peer_id}"),
                 }
             }
@@ -135,12 +270,20 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                 endpoint,
                 ..
             } => {
+                connected_peers.insert(peer_id);
+                seen_peers.insert(peer_id);
                 println!("peer connected: {peer_id} via {endpoint:?}");
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
                 Some(peer_id) => {
-                    seen_peers.remove(&peer_id);
-                    eprintln!("outgoing dial failed for {peer_id}: {error}");
+                    if connected_peers.contains(&peer_id) {
+                        eprintln!(
+                            "outgoing dial failed for {peer_id}, but peer is already connected: {error}"
+                        );
+                    } else {
+                        seen_peers.remove(&peer_id);
+                        eprintln!("outgoing dial failed for {peer_id}: {error}");
+                    }
                 }
                 None => eprintln!("outgoing dial failed for unknown peer: {error}"),
             },
