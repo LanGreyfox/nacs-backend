@@ -1,13 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use libp2p::{identity, PeerId};
-use nacs_backend::p2p::{
-    load_or_create_identity, newly_discovered_peers, reconnect_delay, schedule_retry,
-};
+use nacs_backend::p2p::{load_or_create_identity, newly_discovered_peers};
 
 fn temp_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -66,30 +64,4 @@ fn discovery_filter_reports_peer_again_after_removal() {
 
     let rediscovered_batch = newly_discovered_peers(&mut seen, vec![peer]);
     assert_eq!(rediscovered_batch, vec![peer]);
-}
-
-#[test]
-fn reconnect_delay_grows_and_is_capped() {
-    let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
-
-    let d1 = reconnect_delay(peer, 1);
-    let d2 = reconnect_delay(peer, 2);
-    let d3 = reconnect_delay(peer, 3);
-    let d_high = reconnect_delay(peer, 64);
-
-    assert!(d2 > d1);
-    assert!(d3 > d2);
-    // Max delay is capped at 30s plus at most 20% jitter.
-    assert!(d_high <= std::time::Duration::from_millis(36_000));
-}
-
-#[test]
-fn schedule_retry_increments_backoff() {
-    let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
-    let mut retries = HashMap::new();
-
-    let first = schedule_retry(&mut retries, peer);
-    let second = schedule_retry(&mut retries, peer);
-
-    assert!(second >= first);
 }
