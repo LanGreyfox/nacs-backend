@@ -16,8 +16,7 @@
 │   ├── db.rs                # SQLite persistence layer and background worker
 │   ├── webdav.rs            # WebDAV server implementation
 │   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
-│   ├── lib.rs               # Library exports and shared functionality
-│   └── p2p.rs               # P2P discovery and peer communication
+│   └── lib.rs               # Library exports and shared functionality
 ├── tests/
 │   ├── webdav_tests.rs      # WebDAV helper tests
 │   ├── db_tests.rs          # SQLite persistence integration tests
@@ -51,10 +50,13 @@
 ✅ Data Directory: ./data (auto-created)
 ✅ SQLite Directory: ./sqlite (auto-created)
 ✅ SQLite File: ./sqlite/webdav.db
-✅ P2P Identity File: ./p2p_identity.key (auto-created)
+✅ P2P Identity File: ./sqlite/p2p_identity.key (auto-created)
 ✅ Lock System: FakeLs (for simple tests)
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
+✅ Swarm Idle Timeout: 60 seconds
+✅ Heartbeat: Ping every 10s, timeout 8s
+✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
 ```
 
 ---
@@ -68,6 +70,8 @@
 - [x] P2P peer discovery with libp2p (mDNS)
 - [x] Encrypted P2P transport (Noise + Yamux)
 - [x] P2P identity management and persistence
+- [x] 60s idle timeout with explicit keepalive behaviour
+- [x] Heartbeat-based peer reachability checks
 - [x] Integration tests in `tests/db_tests.rs`
 - [x] P2P discovery tests in `tests/p2p_tests.rs`
 - [ ] Prepared SQL statements in `src/main.rs`
@@ -123,8 +127,11 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 **P2P Features:**
 - **Transport:** TCP with Noise encryption + Yamux multiplexing
 - **Discovery:** mDNS for automatic peer detection on LAN
-- **Identity:** Persistent peer identity stored in `p2p_identity.key`
+- **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
+- **Heartbeat policy:** Ping interval 10s, timeout 8s
+- **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
+- **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
 
 ---
 
@@ -154,9 +161,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-07-25 (P2P feature added) |
+| **Last Updated** | 2026-07-26 (P2P keepalive + runtime behavior update) |
 | **Status** | ✅ Active project info for future interactions |
-| **P2P Status** | ✅ Peer discovery and mDNS implemented |
+| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat and dial guards implemented |
 
 ---
 

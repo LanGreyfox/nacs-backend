@@ -13,8 +13,10 @@ The server also persists WebDAV file events to SQLite through a background worke
 - `src/main.rs` — binary entry point and startup wiring
 - `src/webdav.rs` — WebDAV request handling, auth, and event mapping
 - `src/db.rs` — SQLite persistence layer and background worker
+- `src/p2p.rs` — libp2p discovery, heartbeat, and peer connection lifecycle
 - `tests/webdav_tests.rs` — WebDAV helper tests
 - `tests/db_tests.rs` — SQLite persistence integration tests
+- `tests/p2p_tests.rs` — P2P identity/discovery helper tests
 
 ## Default configuration
 
@@ -54,6 +56,20 @@ The database stores:
 - the append-only event history in `events`
 
 Each stored record includes the current folder, whether the resource is a file or folder, and a checksum for files.
+
+## P2P behavior
+
+- Discovery uses mDNS on the local network.
+- Transport uses TCP with Noise encryption and Yamux multiplexing.
+- Swarm idle timeout is set to 60 seconds.
+- Ping heartbeat runs every 10 seconds with an 8-second timeout.
+- A custom keepalive behaviour is enabled so established connections stay open even though ping streams are excluded from keepalive in this libp2p version.
+
+Current failure/reconnect semantics:
+
+- On heartbeat failure, the peer is removed from active peer tracking immediately.
+- There is no dedicated reconnect backoff scheduler at the moment.
+- Reconnect attempts happen through the normal discovery/dial flow when peers are discovered again.
 
 ## Build & Run
 
