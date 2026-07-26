@@ -18,9 +18,11 @@ use libp2p::{
 
 const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
+// Keep this well below the idle timeout so periodic ping traffic keeps
+// otherwise quiet connections open.
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
-const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 31_536_000;
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
