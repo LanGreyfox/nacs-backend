@@ -38,6 +38,19 @@ fn manifest_entry(path: &str, checksum: &str, updated_at: &str) -> ManifestEntry
     }
 }
 
+fn manifest_with_resource(path: &str, kind: &str, checksum: &str, updated_at: &str) -> Manifest {
+    Manifest {
+        resources: vec![ManifestEntry {
+            resource_path: path.to_string(),
+            resource_kind: kind.to_string(),
+            checksum: Some(checksum.to_string()),
+            size: 4,
+            updated_at: updated_at.to_string(),
+        }],
+        tombstones: vec![],
+    }
+}
+
 // --- Wire type serialization round-trips (JSON stand-in for the CBOR codec
 // actually used on the wire; guards against accidentally introducing
 // non-serializable fields into the wire types). ---
@@ -215,6 +228,105 @@ fn diff_manifests_is_empty_for_identical_manifests() {
     };
 
     assert!(diff_manifests(&manifest, &manifest).is_empty());
+}
+
+// --- Tests moved from src/sync.rs ---
+
+#[test]
+fn moved_pulls_file_missing_locally() {
+    let local = Manifest::default();
+    let remote = manifest_with_resource("/docs/a.txt", "file", "abc", "2026-01-01 00:00:00");
+
+    assert_eq!(
+        diff_manifests(&local, &remote),
+        vec![SyncAction::Pull {
+            path: "/docs/a.txt".to_string(),
+            checksum: Some("abc".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn moved_creates_dir_missing_locally() {
+    let local = Manifest::default();
+    let remote = Manifest {
+        resources: vec![ManifestEntry {
+            resource_path: "/docs".to_string(),
+            resource_kind: "folder".to_string(),
+            checksum: None,
+            size: 0,
+            updated_at: "2026-01-01 00:00:00".to_string(),
+        }],
+        tombstones: vec![],
+    };
+
+    assert_eq!(
+        diff_manifests(&local, &remote),
+        vec![SyncAction::CreateDir {
+            path: "/docs".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn moved_no_action_when_local_is_newer() {
+    let local = manifest_with_resource("/docs/a.txt", "file", "newer", "2026-02-01 00:00:00");
+    let remote = manifest_with_resource("/docs/a.txt", "file", "older", "2026-01-01 00:00:00");
+
+    assert!(diff_manifests(&local, &remote).is_empty());
+}
+
+#[test]
+fn moved_remote_tombstone_newer_than_local_live_deletes_locally() {
+    let local = manifest_with_resource("/docs/a.txt", "file", "abc", "2026-01-01 00:00:00");
+    let remote = Manifest {
+        resources: vec![],
+        tombstones: vec![TombstoneEntry {
+            resource_path: "/docs/a.txt".to_string(),
+            deleted_at: "2026-02-01 00:00:00".to_string(),
+        }],
+    };
+
+    assert_eq!(
+        diff_manifests(&local, &remote),
+        vec![SyncAction::Delete {
+            path: "/docs/a.txt".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn moved_remote_tombstone_older_than_local_live_is_ignored() {
+    let local = manifest_with_resource("/docs/a.txt", "file", "abc", "2026-02-01 00:00:00");
+    let remote = Manifest {
+        resources: vec![],
+        tombstones: vec![TombstoneEntry {
+            resource_path: "/docs/a.txt".to_string(),
+            deleted_at: "2026-01-01 00:00:00".to_string(),
+        }],
+    };
+
+    assert!(diff_manifests(&local, &remote).is_empty());
+}
+
+#[test]
+fn moved_both_tombstoned_is_a_no_op() {
+    let local = Manifest {
+        resources: vec![],
+        tombstones: vec![TombstoneEntry {
+            resource_path: "/docs/a.txt".to_string(),
+            deleted_at: "2026-01-01 00:00:00".to_string(),
+        }],
+    };
+    let remote = Manifest {
+        resources: vec![],
+        tombstones: vec![TombstoneEntry {
+            resource_path: "/docs/a.txt".to_string(),
+            deleted_at: "2026-02-01 00:00:00".to_string(),
+        }],
+    };
+
+    assert!(diff_manifests(&local, &remote).is_empty());
 }
 
 // --- Chunked transfer state machine (finalize + checksum verification) ---
