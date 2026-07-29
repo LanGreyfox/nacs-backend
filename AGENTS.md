@@ -137,7 +137,6 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
 - **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
-- **Reconnect policy:** Exponential backoff with jitter retries failed dials and disconnects; mDNS rediscovery still provides fresh peer addresses
 
 ---
 
