@@ -5,7 +5,7 @@
 |-----------|-------|
 | **Language** | Rust |
 | **Version** | 0.1.0 |
-| **Primary Function** | WebDAV Server with P2P Discovery based on `dav-server` and `libp2p` |
+| **Primary Function** | WebDAV Server with P2P Discovery and file sync based on `dav-server` and `libp2p` |
 
 ---
 
@@ -16,11 +16,13 @@
 │   ├── db.rs                # SQLite persistence layer and background worker
 │   ├── webdav.rs            # WebDAV server implementation
 │   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
+│   ├── sync.rs              # P2P file replication protocol and reconciliation
 │   └── lib.rs               # Library exports and shared functionality
 ├── tests/
 │   ├── webdav_tests.rs      # WebDAV helper tests
 │   ├── db_tests.rs          # SQLite persistence integration tests
 │   └── p2p_tests.rs         # P2P discovery and peer tests
+│   └── sync_tests.rs        # P2P sync protocol tests
 ├── Cargo.toml               # Dependencies & package configuration
 ├── AGENTS.md                # Agent project information ✅
 ├── data/                    # WebDAV storage directory (auto-created)
@@ -54,6 +56,8 @@
 ✅ Lock System: FakeLs (for simple tests)
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
+✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1
+✅ P2P Sync Chunking: 256 KiB pull-based file transfers with checksum verification
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
@@ -70,12 +74,13 @@
 - [x] P2P peer discovery with libp2p (mDNS)
 - [x] Encrypted P2P transport (Noise + Yamux)
 - [x] P2P identity management and persistence
+- [x] P2P file replication and manifest reconciliation
 - [x] 60s idle timeout with explicit keepalive behaviour
 - [x] Heartbeat-based peer reachability checks
 - [x] Integration tests in `tests/db_tests.rs`
 - [x] P2P discovery tests in `tests/p2p_tests.rs`
+- [x] P2P sync protocol tests in `tests/sync_tests.rs`
 - [ ] Prepared SQL statements in `src/main.rs`
-- [ ] P2P content replication between peers
 
 ---
 
@@ -144,6 +149,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | **Tests** | `cargo test` |
 | **DB tests** | `cargo test --test db_tests` |
 | **P2P tests** | `cargo test --test p2p_tests` |
+| **Sync tests** | `cargo test --test sync_tests` |
 | **All tests** | `cargo test --all` |
 | **Set P2P Port** | `P2P_PORT=5001 cargo run` |
 
@@ -161,9 +167,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-07-26 (P2P keepalive + runtime behavior update) |
+| **Last Updated** | 2026-07-29 (P2P sync protocol + chunked file replication update) |
 | **Status** | ✅ Active project info for future interactions |
-| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat and dial guards implemented |
+| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
 
 ---
 

@@ -3,6 +3,8 @@
 This repository contains a WebDAV server built with dav-server and Tokio.
 
 The server also persists WebDAV file events to SQLite through a background worker.
+It now includes a P2P file replication layer that can exchange manifests and
+transfer file contents in chunked pull-based requests.
 
 ## Requirements
 
@@ -14,9 +16,11 @@ The server also persists WebDAV file events to SQLite through a background worke
 - `src/webdav.rs` — WebDAV request handling, auth, and event mapping
 - `src/db.rs` — SQLite persistence layer and background worker
 - `src/p2p.rs` — libp2p discovery, heartbeat, and peer connection lifecycle
+- `src/sync.rs` — P2P file replication protocol, manifest diffing, and chunked transfers
 - `tests/webdav_tests.rs` — WebDAV helper tests
 - `tests/db_tests.rs` — SQLite persistence integration tests
 - `tests/p2p_tests.rs` — P2P identity/discovery helper tests
+- `tests/sync_tests.rs` — P2P sync protocol and chunk transfer tests
 
 ## Default configuration
 
@@ -64,6 +68,16 @@ Each stored record includes the current folder, whether the resource is a file o
 - Swarm idle timeout is set to 60 seconds.
 - Ping heartbeat runs every 10 seconds with an 8-second timeout.
 - A custom keepalive behaviour is enabled so established connections stay open even though ping streams are excluded from keepalive in this libp2p version.
+
+## P2P sync
+
+- Nodes exchange a manifest that includes live resources and tombstones.
+- Sync decisions are made with last-write-wins timestamp comparison.
+- File contents are pulled on demand through `FetchFile` requests and `Chunk` responses.
+- Transfers are limited to 256 KiB per chunk and are verified with SHA-256 before the file is materialized locally.
+- The wire protocol uses libp2p request-response with CBOR encoding under `/nacs-backend/sync/1`.
+
+This keeps the sync path bounded in memory and avoids eager pushes of file bytes.
 
 Current failure/reconnect semantics:
 
@@ -134,6 +148,7 @@ Linux Dolphin example URL:
 - The Basic Auth header is parsed as standard HTTP Basic Auth (`Authorization: Basic <base64(user:pass)>`) and then compared to `WEBDAV_USER`/`WEBDAV_PASS`.
 - SQLite writes are handled by a dedicated background worker, so the WebDAV request path stays responsive.
 - Checksum values are computed for files and stored in the database.
+- P2P sync currently replicates file and folder state by exchanging manifests and pulling content only when needed.
 - If you prefer a different behavior (for example: allow missing credentials, read from a config file, or support multiple users), I can update the implementation accordingly.
 
 ## License
