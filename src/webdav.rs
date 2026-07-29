@@ -1,6 +1,7 @@
 use std::{convert::Infallible, io, net::SocketAddr, path::Path};
 
-use crate::db::{Database, EventEnvelope, EventKind};
+use crate::db::{file_checksum_and_size, Database, EventEnvelope, EventKind};
+use crate::sync::{FileChangeEvent, P2pHandle};
 use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
 use dav_server::body::Body;
 use hyper::{header::HeaderMap, server::conn::http1, service::service_fn, Method, Response, StatusCode, Uri};
@@ -269,11 +270,17 @@ fn required_env_var(name: &str) -> io::Result<String> {
     })
 }
 
-pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Database) -> io::Result<()> {
+pub async fn run_server(
+    addr: SocketAddr,
+    dir: impl AsRef<Path>,
+    database: Database,
+    p2p: P2pHandle,
+) -> io::Result<()> {
     ensure_data_dir(dir.as_ref()).await?;
     // Read credentials from environment
     let username = required_env_var("WEBDAV_USER")?;
     let password = required_env_var("WEBDAV_PASS")?;
+    let data_dir = dir.as_ref().to_path_buf();
 
     let dav_server = build_handler(dir.as_ref());
     let listener = TcpListener::bind(addr).await?;
@@ -284,6 +291,8 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
         let (stream, _) = listener.accept().await?;
         let dav_server = dav_server.clone();
         let database = database.clone();
+        let p2p = p2p.clone();
+        let data_dir = data_dir.clone();
         let username = username.clone();
         let password = password.clone();
         let io = TokioIo::new(stream);
@@ -298,6 +307,8 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
                             let username = username.clone();
                             let password = password.clone();
                             let database = database.clone();
+                            let p2p = p2p.clone();
+                            let data_dir = data_dir.clone();
                             async move {
                                 let method = req.method().clone();
                                 let uri = req.uri().clone();
@@ -346,6 +357,22 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
                                         destination_path: destination.clone(),
                                         method: method.as_str().to_string(),
                                         status_code: status.as_u16(),
+                                        username: username.clone(),
+                                    });
+
+                                    let final_path =
+                                        destination.clone().unwrap_or_else(|| uri.path().to_string());
+                                    let (checksum, size) =
+                                        match file_checksum_and_size(&data_dir, &final_path) {
+                                            Ok(Some((checksum, size))) => (Some(checksum), size),
+                                            Ok(None) | Err(_) => (None, 0),
+                                        };
+                                    p2p.announce(FileChangeEvent {
+                                        event_kind,
+                                        source_path: uri.path().to_string(),
+                                        destination_path: destination.clone(),
+                                        checksum,
+                                        size,
                                         username: username.clone(),
                                     });
                                 }

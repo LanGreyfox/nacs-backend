@@ -15,6 +15,7 @@ use libp2p::{
     mdns,
     noise,
     ping,
+    request_response,
     swarm::{
         behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
         ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent,
@@ -23,8 +24,12 @@ use libp2p::{
         handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
         StreamUpgradeError, SubstreamProtocol,
     },
-    tcp, yamux, PeerId, SwarmBuilder,
+    tcp, yamux, PeerId, StreamProtocol, SwarmBuilder,
 };
+use tokio::sync::mpsc;
+
+use crate::db::Database;
+use crate::sync::{self, SyncRequest, SyncResponse, SyncState};
 
 const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
@@ -33,12 +38,14 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
 const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
+const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
     keep_alive: KeepAliveBehaviour,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
+    sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
 // In libp2p 0.56, ping streams are intentionally ignored for keep-alive.
@@ -144,8 +151,14 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
     }
 }
 
-pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
+pub async fn run_discovery(
+    base_dir: impl AsRef<Path>,
+    data_dir: impl AsRef<Path>,
+    database: Database,
+    mut announce_rx: mpsc::UnboundedReceiver<sync::FileChangeEvent>,
+) -> io::Result<()> {
     let key_path = key_path(base_dir.as_ref());
+    let data_dir = data_dir.as_ref().to_path_buf();
     let local_key = load_or_create_identity(&key_path).await?;
     let local_peer_id = PeerId::from(local_key.public());
     let listen_port = configured_peer_port()?;
@@ -170,11 +183,19 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                     .with_interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
                     .with_timeout(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)),
             );
+            let sync = request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new(SYNC_PROTOCOL),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default(),
+            );
 
             Ok(DiscoveryBehaviour {
                 keep_alive,
                 mdns,
                 ping,
+                sync,
             })
         })
         .map_err(io::Error::other)?
@@ -193,8 +214,11 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 
     let mut seen_peers = HashSet::new();
     let mut connected_peers = HashSet::new();
+    let mut sync_state = SyncState::new();
     loop {
-        match swarm.select_next_some().await {
+        tokio::select! {
+            event = swarm.select_next_some() => {
+        match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("p2p listening on {address}");
             }
@@ -245,6 +269,66 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                     }
                 }
             }
+            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::Message {
+                peer,
+                message,
+                ..
+            })) => match message {
+                request_response::Message::Request { request, channel, .. } => match request {
+                    SyncRequest::Manifest => {
+                        let response = match database.manifest().await {
+                            Ok(manifest) => SyncResponse::Manifest(manifest),
+                            Err(err) => {
+                                eprintln!("failed to build manifest for {peer}: {err}");
+                                SyncResponse::Manifest(Default::default())
+                            }
+                        };
+                        let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                    }
+                    SyncRequest::FetchFile { path, offset } => {
+                        let response = sync::read_chunk(&data_dir, &path, offset).await;
+                        let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                    }
+                    SyncRequest::Event(event) => {
+                        let _ = swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Ack);
+                        match sync::handle_incoming_event(&data_dir, &database, &mut sync_state, peer, event).await {
+                            Ok(Some(request)) => {
+                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                            }
+                            Ok(None) => {}
+                            Err(err) => eprintln!("failed to apply incoming p2p event from {peer}: {err}"),
+                        }
+                    }
+                },
+                request_response::Message::Response { response, .. } => match response {
+                    SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
+                        Ok(local_manifest) => {
+                            let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
+                            let requests = sync::apply_manifest_actions(
+                                &data_dir,
+                                &database,
+                                &mut sync_state,
+                                peer,
+                                actions,
+                            )
+                            .await;
+                            for request in requests {
+                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                            }
+                        }
+                        Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
+                    },
+                    other => {
+                        match sync::handle_chunk_response(&mut sync_state, &database, peer, other).await {
+                            Ok(Some(request)) => {
+                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                            }
+                            Ok(None) => {}
+                            Err(err) => eprintln!("failed to process chunk response from {peer}: {err}"),
+                        }
+                    }
+                },
+            },
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 cause,
@@ -276,6 +360,8 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                 connected_peers.insert(peer_id);
                 seen_peers.insert(peer_id);
                 println!("peer connected: {peer_id} via {endpoint:?}");
+                // Kick off initial reconciliation with the newly (re)connected peer.
+                swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
                 Some(peer_id) => {
@@ -291,6 +377,16 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
                 None => eprintln!("outgoing dial failed for unknown peer: {error}"),
             },
             _ => {}
+        }
+            }
+            Some(change_event) = announce_rx.recv() => {
+                for peer in connected_peers.iter() {
+                    swarm
+                        .behaviour_mut()
+                        .sync
+                        .send_request(peer, SyncRequest::Event(change_event.clone()));
+                }
+            }
         }
     }
 }

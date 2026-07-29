@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const DB_FILENAME: &str = "webdav.db";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
     Created,
     Edited,
@@ -47,6 +47,33 @@ pub struct EventEnvelope {
     pub username: String,
 }
 
+/// A single currently-live resource, as reported to peers during manifest exchange.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestEntry {
+    pub resource_path: String,
+    pub resource_kind: String,
+    pub checksum: Option<String>,
+    pub size: u64,
+    pub updated_at: String,
+}
+
+/// A tombstone for a path that used to exist but was deleted and has not
+/// been recreated since. Derived from `resource_archive` rows whose path is
+/// no longer present in `resources`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TombstoneEntry {
+    pub resource_path: String,
+    pub deleted_at: String,
+}
+
+/// Full snapshot of a node's known resource state, exchanged with peers to
+/// drive initial reconciliation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    pub resources: Vec<ManifestEntry>,
+    pub tombstones: Vec<TombstoneEntry>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceKind {
     File,
@@ -79,6 +106,7 @@ pub struct Database {
 
 enum Command {
     Record(EventEnvelope),
+    Manifest(oneshot::Sender<Result<Manifest, String>>),
 }
 
 impl Database {
@@ -102,6 +130,22 @@ impl Database {
 
     pub fn record(&self, event: EventEnvelope) {
         let _ = self.tx.send(Command::Record(event));
+    }
+
+    /// Fetches a full snapshot of currently-live resources plus tombstones
+    /// for paths that were deleted and not recreated since. Used to drive
+    /// initial reconciliation with a newly discovered peer.
+    pub async fn manifest(&self) -> io::Result<Manifest> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Manifest(reply_tx))
+            .map_err(|_| io::Error::other("sqlite worker has shut down"))?;
+
+        match reply_rx.await {
+            Ok(Ok(manifest)) => Ok(manifest),
+            Ok(Err(err)) => Err(io::Error::other(err)),
+            Err(_) => Err(io::Error::other("sqlite worker dropped manifest request")),
+        }
     }
 }
 
@@ -132,6 +176,10 @@ fn run_worker(
                 if let Err(err) = apply_event(&mut conn, &data_dir, event) {
                     eprintln!("failed to persist webdav event: {err}");
                 }
+            }
+            Command::Manifest(reply_tx) => {
+                let result = build_manifest(&conn, &data_dir).map_err(|err| err.to_string());
+                let _ = reply_tx.send(result);
             }
         }
     }
@@ -206,6 +254,69 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
         "#,
     )
+}
+
+fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manifest> {
+    let mut resources_stmt = conn.prepare(
+        r#"
+        SELECT resource_path, resource_kind, checksum, updated_at
+        FROM resources
+        "#,
+    )?;
+    let resources = resources_stmt
+        .query_map([], |row| {
+            let resource_path: String = row.get(0)?;
+            let resource_kind: String = row.get(1)?;
+            let checksum: Option<String> = row.get(2)?;
+            let updated_at: String = row.get(3)?;
+            Ok((resource_path, resource_kind, checksum, updated_at))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(resource_path, resource_kind, checksum, updated_at)| {
+            let size = if resource_kind == "folder" {
+                0
+            } else {
+                file_size(data_dir, &resource_path).unwrap_or(0)
+            };
+            ManifestEntry {
+                resource_path,
+                resource_kind,
+                checksum,
+                size,
+                updated_at,
+            }
+        })
+        .collect();
+
+    let mut tombstones_stmt = conn.prepare(
+        r#"
+        SELECT resource_path, MAX(archived_at)
+        FROM resource_archive
+        WHERE archived_reason = 'delete'
+          AND resource_path NOT IN (SELECT resource_path FROM resources)
+        GROUP BY resource_path
+        "#,
+    )?;
+    let tombstones = tombstones_stmt
+        .query_map([], |row| {
+            Ok(TombstoneEntry {
+                resource_path: row.get(0)?,
+                deleted_at: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Manifest {
+        resources,
+        tombstones,
+    })
+}
+
+fn file_size(data_dir: &Path, webdav_path: &str) -> io::Result<u64> {
+    let rel = webdav_path.trim_start_matches('/');
+    let metadata = fs::metadata(data_dir.join(rel))?;
+    Ok(metadata.len())
 }
 
 fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> rusqlite::Result<()> {
@@ -492,11 +603,22 @@ fn resolve_resource_kind(event_kind: EventKind, existing: Option<&ResourceRow>) 
 }
 
 fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<String>> {
+    Ok(file_checksum_and_size(data_dir, webdav_path)?.map(|(checksum, _size)| checksum))
+}
+
+/// Computes the SHA-256 checksum and byte size of a resource on disk. Shared
+/// by the local event-recording path and the WebDAV layer, which needs the
+/// same values to announce changes to p2p peers.
+pub(crate) fn file_checksum_and_size(
+    data_dir: &Path,
+    webdav_path: &str,
+) -> io::Result<Option<(String, u64)>> {
     let rel = webdav_path.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
     let mut file = fs::File::open(&fs_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
+    let mut size: u64 = 0;
 
     loop {
         let read = file.read(&mut buffer)?;
@@ -504,9 +626,10 @@ fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<Str
             break;
         }
         hasher.update(&buffer[..read]);
+        size += read as u64;
     }
 
-    Ok(Some(format!("{:x}", hasher.finalize())))
+    Ok(Some((format!("{:x}", hasher.finalize()), size)))
 }
 
 fn normalize_path(path: &str) -> String {

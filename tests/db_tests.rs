@@ -274,3 +274,79 @@ async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
     fs::remove_dir_all(&sqlite_dir).expect("sqlite temp dir should be removed");
     fs::remove_dir_all(&data_dir).expect("data temp dir should be removed");
 }
+
+#[tokio::test]
+async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
+    let base_dir = temp_dir("db-manifest");
+    let sqlite_path = base_dir.join("webdav.db");
+    let keep_content = b"keep me around";
+
+    fs::create_dir_all(&base_dir).expect("temp dir should exist");
+    fs::write(base_dir.join("keep.txt"), keep_content).expect("keep.txt should be created");
+    fs::write(base_dir.join("gone.txt"), b"will be deleted").expect("gone.txt should be created");
+
+    let database = open_database(&base_dir, &base_dir).await;
+
+    database.record(EventEnvelope {
+        event_kind: EventKind::Created,
+        source_path: "/keep.txt".to_string(),
+        destination_path: None,
+        method: "PUT".to_string(),
+        status_code: 201,
+        username: "alice".to_string(),
+    });
+    database.record(EventEnvelope {
+        event_kind: EventKind::Created,
+        source_path: "/gone.txt".to_string(),
+        destination_path: None,
+        method: "PUT".to_string(),
+        status_code: 201,
+        username: "alice".to_string(),
+    });
+
+    wait_for_condition(Duration::from_secs(2), || {
+        if !sqlite_path.exists() {
+            return false;
+        }
+        let conn = open_conn(&sqlite_path);
+        let resource_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .expect("should query resource count");
+        resource_count == 2
+    });
+
+    fs::remove_file(base_dir.join("gone.txt")).expect("gone.txt should be removable");
+    database.record(EventEnvelope {
+        event_kind: EventKind::Deleted,
+        source_path: "/gone.txt".to_string(),
+        destination_path: None,
+        method: "DELETE".to_string(),
+        status_code: 204,
+        username: "alice".to_string(),
+    });
+
+    wait_for_condition(Duration::from_secs(2), || {
+        let conn = open_conn(&sqlite_path);
+        let resource_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .expect("should query resource count");
+        let archive_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resource_archive", [], |row| row.get(0))
+            .expect("should query archive count");
+        resource_count == 1 && archive_count == 1
+    });
+
+    let manifest = database.manifest().await.expect("manifest should be readable");
+
+    assert_eq!(manifest.resources.len(), 1);
+    let entry = &manifest.resources[0];
+    assert_eq!(entry.resource_path, "/keep.txt");
+    assert_eq!(entry.resource_kind, "file");
+    assert_eq!(entry.size, keep_content.len() as u64);
+    assert_eq!(entry.checksum.as_deref(), Some(sha256_hex(keep_content).as_str()));
+
+    assert_eq!(manifest.tombstones.len(), 1);
+    assert_eq!(manifest.tombstones[0].resource_path, "/gone.txt");
+
+    fs::remove_dir_all(&base_dir).expect("temp dir should be removed");
+}
