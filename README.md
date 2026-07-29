@@ -82,8 +82,8 @@ This keeps the sync path bounded in memory and avoids eager pushes of file bytes
 Current failure/reconnect semantics:
 
 - On heartbeat failure, the peer is removed from active peer tracking immediately.
-- There is no dedicated reconnect backoff scheduler at the moment.
-- Reconnect attempts happen through the normal discovery/dial flow when peers are discovered again.
+- Failed dials and disconnects schedule retries with exponential backoff and jitter.
+- Reconnect attempts still rely on mDNS rediscovery, but peers are also retried automatically after transient failures.
 
 ## Build & Run
 

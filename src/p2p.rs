@@ -1,11 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     convert::Infallible,
     error::Error,
+    hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use libp2p::{
@@ -38,7 +39,70 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
 const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
+const RECONNECT_BASE_DELAY_MS: u64 = 500;
+const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+const RECONNECT_JITTER_PERCENT: u64 = 20;
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetryState {
+    failures: u32,
+    next_attempt_at: Instant,
+}
+
+fn next_retry_delay(retries: &HashMap<PeerId, RetryState>) -> Option<Duration> {
+    let now = Instant::now();
+
+    retries
+        .values()
+        .map(|state| {
+            if state.next_attempt_at <= now {
+                Duration::ZERO
+            } else {
+                state.next_attempt_at.duration_since(now)
+            }
+        })
+        .min()
+}
+
+pub fn reconnect_delay(peer_id: PeerId, failures: u32) -> Duration {
+    let exp = failures.saturating_sub(1).min(16);
+    let exp_factor = 1u64 << exp;
+    let base_ms = RECONNECT_BASE_DELAY_MS
+        .saturating_mul(exp_factor)
+        .min(RECONNECT_MAX_DELAY_MS);
+
+    let mut hasher = DefaultHasher::new();
+    peer_id.hash(&mut hasher);
+    failures.hash(&mut hasher);
+    let jitter_seed = hasher.finish();
+    let jitter_ceiling = base_ms.saturating_mul(RECONNECT_JITTER_PERCENT) / 100;
+    let jitter = if jitter_ceiling == 0 {
+        0
+    } else {
+        jitter_seed % (jitter_ceiling + 1)
+    };
+
+    Duration::from_millis(base_ms.saturating_add(jitter))
+}
+
+pub fn schedule_retry(retries: &mut HashMap<PeerId, RetryState>, peer_id: PeerId) -> Duration {
+    let now = Instant::now();
+    let failures = retries
+        .get(&peer_id)
+        .map_or(1, |state| state.failures.saturating_add(1));
+    let delay = reconnect_delay(peer_id, failures);
+
+    retries.insert(
+        peer_id,
+        RetryState {
+            failures,
+            next_attempt_at: now + delay,
+        },
+    );
+
+    delay
+}
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
@@ -214,170 +278,199 @@ pub async fn run_discovery(
 
     let mut seen_peers = HashSet::new();
     let mut connected_peers = HashSet::new();
+    let mut dialing_peers = HashSet::new();
+    let mut pending_retries = HashMap::new();
     let mut sync_state = SyncState::new();
     loop {
+        let retry_delay = next_retry_delay(&pending_retries);
+
         tokio::select! {
             event = swarm.select_next_some() => {
-        match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                println!("p2p listening on {address}");
-            }
-            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-                for (peer_id, peer_addr) in peers {
-                    if peer_id == local_peer_id {
-                        continue;
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("p2p listening on {address}");
                     }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                        for (peer_id, peer_addr) in peers {
+                            if peer_id == local_peer_id {
+                                continue;
+                            }
 
-                    if connected_peers.contains(&peer_id) {
-                        seen_peers.insert(peer_id);
-                        continue;
+                            let is_new_discovery = seen_peers.insert(peer_id);
+
+                            if connected_peers.contains(&peer_id) || dialing_peers.contains(&peer_id) {
+                                continue;
+                            }
+
+                            let retry_was_pending = pending_retries.remove(&peer_id).is_some();
+
+                            if is_new_discovery || retry_was_pending {
+                                println!("new node discovered: {peer_id} at {peer_addr}");
+                                match swarm.dial(peer_id) {
+                                    // Dial by peer id lets mDNS provide/refresh usable addresses.
+                                    Ok(()) => {
+                                        dialing_peers.insert(peer_id);
+                                        println!("dialing peer: {peer_id} (discovered at {peer_addr})");
+                                    }
+                                    Err(err) => {
+                                        let delay = schedule_retry(&mut pending_retries, peer_id);
+                                        eprintln!(
+                                            "failed to dial discovered peer {peer_id}: {err}; next retry in {delay:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                        for (peer_id, _) in peers {
+                            if connected_peers.contains(&peer_id) {
+                                continue;
+                            }
 
-                    if seen_peers.insert(peer_id) {
-                        println!("new node discovered: {peer_id} at {peer_addr}");
-                        match swarm.dial(peer_id) {
-                            // Dial by peer id lets mDNS provide/refresh usable addresses.
-                            Ok(()) => println!("dialing peer: {peer_id} (discovered at {peer_addr})"),
+                            pending_retries.remove(&peer_id);
+                            dialing_peers.remove(&peer_id);
+                            if seen_peers.remove(&peer_id) {
+                                eprintln!("peer no longer discoverable: {peer_id}");
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
+                        match result {
+                            Ok(rtt) => {
+                                println!("heartbeat ok: {peer} rtt={rtt:?}");
+                            }
                             Err(err) => {
-                                seen_peers.remove(&peer_id);
-                                eprintln!("failed to dial discovered peer {peer_id}: {err}");
+                                connected_peers.remove(&peer);
+                                dialing_peers.remove(&peer);
+                                seen_peers.insert(peer);
+                                let delay = schedule_retry(&mut pending_retries, peer);
+                                eprintln!(
+                                    "peer unreachable (heartbeat failed): {peer}: {err}; reconnect in {delay:?}"
+                                );
                             }
                         }
                     }
-                }
-            }
-            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
-                for (peer_id, _) in peers {
-                    if connected_peers.contains(&peer_id) {
-                        continue;
-                    }
-
-                    if seen_peers.remove(&peer_id) {
-                        eprintln!("peer no longer discoverable: {peer_id}");
-                    }
-                }
-            }
-            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
-                match result {
-                    Ok(rtt) => {
-                        println!("heartbeat ok: {peer} rtt={rtt:?}");
-                    }
-                    Err(err) => {
-                        connected_peers.remove(&peer);
-                        seen_peers.remove(&peer);
-                        eprintln!("peer unreachable (heartbeat failed): {peer}: {err}");
-                    }
-                }
-            }
-            SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::Message {
-                peer,
-                message,
-                ..
-            })) => match message {
-                request_response::Message::Request { request, channel, .. } => match request {
-                    SyncRequest::Manifest => {
-                        let response = match database.manifest().await {
-                            Ok(manifest) => SyncResponse::Manifest(manifest),
-                            Err(err) => {
-                                eprintln!("failed to build manifest for {peer}: {err}");
-                                SyncResponse::Manifest(Default::default())
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::Message {
+                        peer,
+                        message,
+                        ..
+                    })) => match message {
+                        request_response::Message::Request { request, channel, .. } => match request {
+                            SyncRequest::Manifest => {
+                                let response = match database.manifest().await {
+                                    Ok(manifest) => SyncResponse::Manifest(manifest),
+                                    Err(err) => {
+                                        eprintln!("failed to build manifest for {peer}: {err}");
+                                        SyncResponse::Manifest(Default::default())
+                                    }
+                                };
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                             }
-                        };
-                        let _ = swarm.behaviour_mut().sync.send_response(channel, response);
-                    }
-                    SyncRequest::FetchFile { path, offset } => {
-                        let response = sync::read_chunk(&data_dir, &path, offset).await;
-                        let _ = swarm.behaviour_mut().sync.send_response(channel, response);
-                    }
-                    SyncRequest::Event(event) => {
-                        let _ = swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Ack);
-                        match sync::handle_incoming_event(&data_dir, &database, &mut sync_state, peer, event).await {
-                            Ok(Some(request)) => {
-                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                            SyncRequest::FetchFile { path, offset } => {
+                                let response = sync::read_chunk(&data_dir, &path, offset).await;
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                             }
-                            Ok(None) => {}
-                            Err(err) => eprintln!("failed to apply incoming p2p event from {peer}: {err}"),
-                        }
-                    }
-                },
-                request_response::Message::Response { response, .. } => match response {
-                    SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
-                        Ok(local_manifest) => {
-                            let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
-                            let requests = sync::apply_manifest_actions(
-                                &data_dir,
-                                &database,
-                                &mut sync_state,
-                                peer,
-                                actions,
-                            )
-                            .await;
-                            for request in requests {
-                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                            SyncRequest::Event(event) => {
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Ack);
+                                match sync::handle_incoming_event(&data_dir, &database, &mut sync_state, peer, event).await {
+                                    Ok(Some(request)) => {
+                                        swarm.behaviour_mut().sync.send_request(&peer, request);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => eprintln!("failed to apply incoming p2p event from {peer}: {err}"),
+                                }
                             }
-                        }
-                        Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
+                        },
+                        request_response::Message::Response { response, .. } => match response {
+                            SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
+                                Ok(local_manifest) => {
+                                    let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
+                                    let requests = sync::apply_manifest_actions(
+                                        &data_dir,
+                                        &database,
+                                        &mut sync_state,
+                                        peer,
+                                        actions,
+                                    )
+                                    .await;
+                                    for request in requests {
+                                        swarm.behaviour_mut().sync.send_request(&peer, request);
+                                    }
+                                }
+                                Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
+                            },
+                            other => {
+                                match sync::handle_chunk_response(&mut sync_state, &database, peer, other).await {
+                                    Ok(Some(request)) => {
+                                        swarm.behaviour_mut().sync.send_request(&peer, request);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => eprintln!("failed to process chunk response from {peer}: {err}"),
+                                }
+                            }
+                        },
                     },
-                    other => {
-                        match sync::handle_chunk_response(&mut sync_state, &database, peer, other).await {
-                            Ok(Some(request)) => {
-                                swarm.behaviour_mut().sync.send_request(&peer, request);
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        cause,
+                        ..
+                    } => {
+                        connected_peers.remove(&peer_id);
+                        dialing_peers.remove(&peer_id);
+                        seen_peers.insert(peer_id);
+                        let delay = schedule_retry(&mut pending_retries, peer_id);
+                        match cause {
+                            Some(ConnectionError::KeepAliveTimeout) => {
+                                eprintln!(
+                                    "peer disconnected: {peer_id} (keepalive timeout expired - no protocol requested connection keep-alive); reconnect in {delay:?}"
+                                )
                             }
-                            Ok(None) => {}
-                            Err(err) => eprintln!("failed to process chunk response from {peer}: {err}"),
+                            Some(ConnectionError::IO(err)) => {
+                                eprintln!(
+                                    "peer disconnected: {peer_id} (I/O error: {err}); reconnect in {delay:?}"
+                                )
+                            }
+                            None => eprintln!("peer disconnected: {peer_id}; reconnect in {delay:?}"),
                         }
                     }
-                },
-            },
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                cause,
-                ..
-            } => {
-                connected_peers.remove(&peer_id);
-                seen_peers.remove(&peer_id);
-                match cause {
-                    Some(ConnectionError::KeepAliveTimeout) => {
-                        eprintln!(
-                            "peer disconnected: {peer_id} (keepalive timeout expired - no protocol requested connection keep-alive)"
-                        )
+                    SwarmEvent::Dialing { peer_id, .. } => match peer_id {
+                        Some(peer_id) => {
+                            dialing_peers.insert(peer_id);
+                            println!("dial started: {peer_id}")
+                        }
+                        None => println!("dial started: unknown peer"),
+                    },
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        endpoint,
+                        ..
+                    } => {
+                        connected_peers.insert(peer_id);
+                        dialing_peers.remove(&peer_id);
+                        seen_peers.insert(peer_id);
+                        pending_retries.remove(&peer_id);
+                        println!("peer connected: {peer_id} via {endpoint:?}");
+                        // Kick off initial reconciliation with the newly (re)connected peer.
+                        swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
                     }
-                    Some(ConnectionError::IO(err)) => {
-                        eprintln!("peer disconnected: {peer_id} (I/O error: {err})")
-                    }
-                    None => eprintln!("peer disconnected: {peer_id}"),
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
+                        Some(peer_id) => {
+                            dialing_peers.remove(&peer_id);
+                            if connected_peers.contains(&peer_id) {
+                                eprintln!(
+                                    "outgoing dial failed for {peer_id}, but peer is already connected: {error}"
+                                );
+                            } else {
+                                seen_peers.insert(peer_id);
+                                let delay = schedule_retry(&mut pending_retries, peer_id);
+                                eprintln!("outgoing dial failed for {peer_id}: {error}; reconnect in {delay:?}");
+                            }
+                        }
+                        None => eprintln!("outgoing dial failed for unknown peer: {error}"),
+                    },
+                    _ => {}
                 }
-            }
-            SwarmEvent::Dialing { peer_id, .. } => match peer_id {
-                Some(peer_id) => println!("dial started: {peer_id}"),
-                None => println!("dial started: unknown peer"),
-            },
-            SwarmEvent::ConnectionEstablished {
-                peer_id,
-                endpoint,
-                ..
-            } => {
-                connected_peers.insert(peer_id);
-                seen_peers.insert(peer_id);
-                println!("peer connected: {peer_id} via {endpoint:?}");
-                // Kick off initial reconciliation with the newly (re)connected peer.
-                swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
-            }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
-                Some(peer_id) => {
-                    if connected_peers.contains(&peer_id) {
-                        eprintln!(
-                            "outgoing dial failed for {peer_id}, but peer is already connected: {error}"
-                        );
-                    } else {
-                        seen_peers.remove(&peer_id);
-                        eprintln!("outgoing dial failed for {peer_id}: {error}");
-                    }
-                }
-                None => eprintln!("outgoing dial failed for unknown peer: {error}"),
-            },
-            _ => {}
-        }
             }
             Some(change_event) = announce_rx.recv() => {
                 for peer in connected_peers.iter() {
@@ -385,6 +478,45 @@ pub async fn run_discovery(
                         .behaviour_mut()
                         .sync
                         .send_request(peer, SyncRequest::Event(change_event.clone()));
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)), if retry_delay.is_some() => {
+                let now = Instant::now();
+                let due_peers: Vec<PeerId> = pending_retries
+                    .iter()
+                    .filter_map(|(peer_id, state)| {
+                        if state.next_attempt_at <= now {
+                            Some(*peer_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for peer_id in due_peers {
+                    if connected_peers.contains(&peer_id) || dialing_peers.contains(&peer_id) {
+                        pending_retries.remove(&peer_id);
+                        continue;
+                    }
+
+                    if !seen_peers.contains(&peer_id) {
+                        pending_retries.remove(&peer_id);
+                        continue;
+                    }
+
+                    match swarm.dial(peer_id) {
+                        Ok(()) => {
+                            dialing_peers.insert(peer_id);
+                            pending_retries.remove(&peer_id);
+                            println!("reconnect dial started: {peer_id}");
+                        }
+                        Err(err) => {
+                            let delay = schedule_retry(&mut pending_retries, peer_id);
+                            eprintln!(
+                                "reconnect dial failed for {peer_id}: {err}; next retry in {delay:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
