@@ -30,7 +30,8 @@ transfer file contents in chunked pull-based requests.
 - SQLite directory: `./sqlite` (created automatically)
 
 The SQLite database file is stored as `./sqlite/webdav.db`.
-The persistent P2P identity key is stored as `./sqlite/p2p_identity.key`.
+The persistent P2P identity key is stored in `./sqlite/`.
+By default port `4001` uses `./sqlite/p2p_identity.key`; other P2P ports use `./sqlite/p2p_identity-<port>.key` so multiple local nodes do not share the same PeerId.
 
 You can override host and port with environment variables:
 
@@ -127,6 +128,7 @@ Expected behavior:
 - Every instance logs its own peer ID (`p2p node started: ...`).
 - Every instance logs discovered peers (`new node discovered: <peer_id>`).
 - With one single instance running, discovery stays idle without errors (0 neighbors).
+- Make sure each node uses a different `P2P_PORT`; the identity key path is derived from that port so peers do not collide on the same checkout.
 
 On first start the application creates `./sqlite/webdav.db` automatically.
 On later starts, the existing database is reused.

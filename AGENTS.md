@@ -52,7 +52,7 @@
 ✅ Data Directory: ./data (auto-created)
 ✅ SQLite Directory: ./sqlite (auto-created)
 ✅ SQLite File: ./sqlite/webdav.db
-✅ P2P Identity File: ./sqlite/p2p_identity.key (auto-created)
+✅ P2P Identity File: ./sqlite/p2p_identity.key for port 4001; ./sqlite/p2p_identity-<port>.key for other P2P ports (auto-created)
 ✅ Lock System: FakeLs (for simple tests)
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing

@@ -221,11 +221,11 @@ pub async fn run_discovery(
     database: Database,
     mut announce_rx: mpsc::UnboundedReceiver<sync::FileChangeEvent>,
 ) -> io::Result<()> {
-    let key_path = key_path(base_dir.as_ref());
     let data_dir = data_dir.as_ref().to_path_buf();
+    let listen_port = configured_peer_port()?;
+    let key_path = key_path(base_dir.as_ref(), listen_port);
     let local_key = load_or_create_identity(&key_path).await?;
     let local_peer_id = PeerId::from(local_key.public());
-    let listen_port = configured_peer_port()?;
 
     println!("p2p node started: {local_peer_id}");
 
@@ -296,6 +296,8 @@ pub async fn run_discovery(
                                 continue;
                             }
 
+                            println!("new node discovered: {peer_id} at {peer_addr}");
+
                             let is_new_discovery = seen_peers.insert(peer_id);
 
                             if connected_peers.contains(&peer_id) || dialing_peers.contains(&peer_id) {
@@ -305,7 +307,6 @@ pub async fn run_discovery(
                             let retry_was_pending = pending_retries.remove(&peer_id).is_some();
 
                             if is_new_discovery || retry_was_pending {
-                                println!("new node discovered: {peer_id} at {peer_addr}");
                                 match swarm.dial(peer_id) {
                                     // Dial by peer id lets mDNS provide/refresh usable addresses.
                                     Ok(()) => {
@@ -523,8 +524,12 @@ pub async fn run_discovery(
     }
 }
 
-fn key_path(base_dir: &Path) -> PathBuf {
-    base_dir.join(KEY_FILENAME)
+fn key_path(base_dir: &Path, listen_port: u16) -> PathBuf {
+    if listen_port == DEFAULT_P2P_PORT {
+        base_dir.join(KEY_FILENAME)
+    } else {
+        base_dir.join(format!("p2p_identity-{listen_port}.key"))
+    }
 }
 
 fn configured_peer_port() -> io::Result<u16> {
