@@ -230,7 +230,9 @@ impl SyncState {
         let target_path = destination_path.as_deref().unwrap_or(&resource_path);
         let rel = target_path.trim_start_matches('/');
         let final_path = data_dir.join(rel);
+        println!("sync: start pull for {resource_path} from peer {peer} -> {}", final_path.display());
         if let Some(parent) = final_path.parent() {
+            println!("sync: ensure parent directory {}", parent.display());
             tokio::fs::create_dir_all(parent).await?;
         }
 
@@ -242,6 +244,7 @@ impl SyncState {
                 .unwrap_or("download")
         );
         let tmp_path = final_path.with_file_name(tmp_name);
+        println!("sync: create temp file {}", tmp_path.display());
         let file = tokio::fs::File::create(&tmp_path).await?;
 
         self.pending.insert(
@@ -278,6 +281,11 @@ impl SyncState {
             None => return Ok(None),
         };
 
+        println!(
+            "sync: write chunk for {} from peer {peer} at offset {offset} ({} bytes)",
+            path,
+            data.len()
+        );
         transfer.file.write_all(&data).await?;
 
         if !is_last {
@@ -292,6 +300,7 @@ impl SyncState {
         transfer.file.flush().await?;
         drop(transfer.file);
 
+        println!("sync: verify checksum for {}", transfer.resource_path);
         let actual_checksum = checksum_file(&transfer.tmp_path).await?;
         if let Some(expected) = &transfer.expected_checksum {
             if expected != &actual_checksum {
@@ -299,11 +308,17 @@ impl SyncState {
                     "sync: checksum mismatch for {} from peer {peer} (expected {expected}, got {actual_checksum}); discarding transfer",
                     transfer.resource_path
                 );
+                println!("sync: remove temp file {}", transfer.tmp_path.display());
                 let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
                 return Ok(None);
             }
         }
 
+        println!(
+            "sync: finalize file {} -> {}",
+            transfer.tmp_path.display(),
+            transfer.final_path.display()
+        );
         tokio::fs::rename(&transfer.tmp_path, &transfer.final_path).await?;
 
         database.record(EventEnvelope {
@@ -342,6 +357,7 @@ async fn checksum_file(path: &Path) -> io::Result<String> {
 async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
     let rel = path.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
+    println!("sync: delete {}", fs_path.display());
     match tokio::fs::metadata(&fs_path).await {
         Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&fs_path).await,
         Ok(_) => tokio::fs::remove_file(&fs_path).await,
@@ -357,6 +373,7 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
 pub async fn read_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
     let rel = path.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
+    println!("sync: serve chunk request for {path} at offset {offset} from {}", fs_path.display());
 
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
@@ -419,7 +436,7 @@ pub async fn handle_chunk_response(
             ..
         } => state.on_chunk(database, peer, path, data, offset, is_last).await,
         SyncResponse::NotFound { path } => {
-            eprintln!("sync: peer {peer} no longer has {path}; dropping pending transfer");
+            println!("sync: peer {peer} no longer has {path}; dropping pending transfer");
             state.cancel(peer, &path);
             Ok(None)
         }
@@ -441,6 +458,7 @@ pub async fn handle_incoming_event(
 ) -> io::Result<Option<SyncRequest>> {
     match event.event_kind {
         EventKind::Deleted => {
+            println!("sync: apply remote delete {}", event.source_path);
             apply_delete(data_dir, &event.source_path).await?;
             database.record(EventEnvelope {
                 event_kind: EventKind::Deleted,
@@ -454,6 +472,7 @@ pub async fn handle_incoming_event(
         }
         EventKind::DirCreated => {
             let rel = event.source_path.trim_start_matches('/');
+            println!("sync: create remote directory {}", data_dir.join(rel).display());
             tokio::fs::create_dir_all(data_dir.join(rel)).await?;
             database.record(EventEnvelope {
                 event_kind: EventKind::DirCreated,
@@ -475,8 +494,10 @@ pub async fn handle_incoming_event(
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
                 if let Some(parent) = dest_fs.parent() {
+                    println!("sync: ensure parent directory {}", parent.display());
                     tokio::fs::create_dir_all(parent).await?;
                 }
+                println!("sync: rename {} -> {}", src_fs.display(), dest_fs.display());
                 tokio::fs::rename(&src_fs, &dest_fs).await?;
                 database.record(EventEnvelope {
                     event_kind: event.event_kind,
@@ -490,6 +511,7 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(None)
             } else {
+                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
                 state
                     .start_pull(
                         data_dir,
@@ -514,8 +536,10 @@ pub async fn handle_incoming_event(
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
                 if let Some(parent) = dest_fs.parent() {
+                    println!("sync: ensure parent directory {}", parent.display());
                     tokio::fs::create_dir_all(parent).await?;
                 }
+                println!("sync: copy {} -> {}", src_fs.display(), dest_fs.display());
                 tokio::fs::copy(&src_fs, &dest_fs).await?;
                 database.record(EventEnvelope {
                     event_kind: EventKind::Copied,
@@ -529,6 +553,7 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(None)
             } else {
+                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
                 state
                     .start_pull(
                         data_dir,
@@ -548,6 +573,7 @@ pub async fn handle_incoming_event(
             if state.is_pending(peer, &path) {
                 Ok(None)
             } else {
+                println!("sync: start pull for incoming {}", path);
                 state
                     .start_pull(
                         data_dir,
@@ -582,6 +608,7 @@ pub async fn apply_manifest_actions(
         match action {
             SyncAction::CreateDir { path } => {
                 let rel = path.trim_start_matches('/');
+                println!("sync: create dir {}", data_dir.join(rel).display());
                 if let Err(err) = tokio::fs::create_dir_all(data_dir.join(rel)).await {
                     eprintln!("sync: failed to create directory {path}: {err}");
                     continue;
@@ -596,6 +623,7 @@ pub async fn apply_manifest_actions(
                 });
             }
             SyncAction::Delete { path } => {
+                println!("sync: delete {}", path);
                 if let Err(err) = apply_delete(data_dir, &path).await {
                     eprintln!("sync: failed to delete {path}: {err}");
                     continue;
@@ -613,6 +641,7 @@ pub async fn apply_manifest_actions(
                 if state.is_pending(peer, &path) {
                     continue;
                 }
+                println!("sync: start manifest pull for {}", path);
                 if let Err(err) = state
                     .start_pull(
                         data_dir,
