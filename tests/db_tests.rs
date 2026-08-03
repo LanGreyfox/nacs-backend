@@ -276,6 +276,27 @@ async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
 }
 
 #[tokio::test]
+async fn manifest_includes_existing_files_and_directories_without_prior_events() {
+    let base_dir = temp_dir("db-manifest-scan");
+    let data_dir = base_dir.join("data");
+    let sqlite_dir = base_dir.join("sqlite");
+
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    fs::create_dir_all(&data_dir.join("docs")).expect("docs dir should be created");
+    fs::write(data_dir.join("docs/readme.txt"), b"hello from disk").expect("test file should be created");
+
+    let database = open_database(&sqlite_dir, &data_dir).await;
+    let manifest = database.manifest().await.expect("manifest should be readable");
+
+    let paths: Vec<_> = manifest.resources.iter().map(|entry| entry.resource_path.clone()).collect();
+    assert!(paths.contains(&"/docs".to_string()));
+    assert!(paths.contains(&"/docs/readme.txt".to_string()));
+    assert!(manifest.resources.iter().any(|entry| entry.resource_kind == "file"));
+
+    fs::remove_dir_all(&base_dir).expect("temp dir should be removed");
+}
+
+#[tokio::test]
 async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
     let base_dir = temp_dir("db-manifest");
     let sqlite_path = base_dir.join("webdav.db");

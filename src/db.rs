@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -263,7 +264,7 @@ fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manife
         FROM resources
         "#,
     )?;
-    let resources = resources_stmt
+    let mut resources: Vec<ManifestEntry> = resources_stmt
         .query_map([], |row| {
             let resource_path: String = row.get(0)?;
             let resource_kind: String = row.get(1)?;
@@ -288,6 +289,14 @@ fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manife
             }
         })
         .collect();
+
+    let mut seen_paths = resources
+        .iter()
+        .map(|entry| entry.resource_path.clone())
+        .collect::<HashSet<_>>();
+    scan_data_dir(data_dir, data_dir, &mut resources, &mut seen_paths).unwrap_or_else(|err| {
+        eprintln!("failed to scan data directory for manifest reconciliation: {err}");
+    });
 
     let mut tombstones_stmt = conn.prepare(
         r#"
@@ -317,6 +326,79 @@ fn file_size(data_dir: &Path, webdav_path: &str) -> io::Result<u64> {
     let rel = webdav_path.trim_start_matches('/');
     let metadata = fs::metadata(data_dir.join(rel))?;
     Ok(metadata.len())
+}
+
+fn scan_data_dir(
+    data_dir: &Path,
+    current_dir: &Path,
+    resources: &mut Vec<ManifestEntry>,
+    seen_paths: &mut HashSet<String>,
+) -> io::Result<()> {
+    let metadata = fs::metadata(current_dir)?;
+    let relative_path = current_dir.strip_prefix(data_dir).unwrap_or_else(|_| Path::new(""));
+    let resource_path = webdav_path(relative_path);
+
+    if metadata.is_dir() {
+        if seen_paths.insert(resource_path.clone()) {
+            resources.push(ManifestEntry {
+                resource_path: resource_path.clone(),
+                resource_kind: "folder".to_string(),
+                checksum: None,
+                size: 0,
+                updated_at: updated_at_for_path(current_dir),
+            });
+        }
+
+        for entry in fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == current_dir {
+                continue;
+            }
+            scan_data_dir(data_dir, &path, resources, seen_paths)?;
+        }
+    } else if metadata.is_file() {
+        if seen_paths.insert(resource_path.clone()) {
+            let (checksum, size) = file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
+            resources.push(ManifestEntry {
+                resource_path: resource_path.clone(),
+                resource_kind: "file".to_string(),
+                checksum: Some(checksum),
+                size,
+                updated_at: updated_at_for_path(current_dir),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn webdav_path(path: &Path) -> String {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_string_lossy().into_owned()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {}
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+fn updated_at_for_path(path: &Path) -> String {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().to_string(),
+        Err(err) => err.duration().as_nanos().to_string(),
+    }
 }
 
 fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> rusqlite::Result<()> {
