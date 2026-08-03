@@ -328,12 +328,22 @@ fn file_size(data_dir: &Path, webdav_path: &str) -> io::Result<u64> {
     Ok(metadata.len())
 }
 
+fn is_sync_temp_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".p2p-tmp"))
+}
+
 fn scan_data_dir(
     data_dir: &Path,
     current_dir: &Path,
     resources: &mut Vec<ManifestEntry>,
     seen_paths: &mut HashSet<String>,
 ) -> io::Result<()> {
+    if is_sync_temp_path(current_dir) {
+        return Ok(());
+    }
+
     let metadata = fs::metadata(current_dir)?;
     let relative_path = current_dir.strip_prefix(data_dir).unwrap_or_else(|_| Path::new(""));
     let resource_path = webdav_path(relative_path);

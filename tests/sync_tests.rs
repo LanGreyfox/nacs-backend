@@ -518,7 +518,64 @@ async fn chunk_transfer_discarded_on_checksum_mismatch() {
         !data_dir.join("bad.txt").exists(),
         "file with mismatched checksum must not be materialized"
     );
+    assert!(
+        !data_dir.join("bad.txt.p2p-tmp").exists(),
+        "temp file should be removed when checksum verification fails"
+    );
     assert!(!state.is_pending(peer, "/bad.txt"));
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn not_found_response_removes_pending_temp_file() {
+    let sqlite_dir = temp_dir("sync-pull-not-found-sqlite");
+    let data_dir = temp_dir("sync-pull-not-found-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/missing.txt".to_string(),
+        destination_path: None,
+        checksum: None,
+        size: 123,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+        .await
+        .expect("handling the event should succeed");
+
+    assert!(
+        data_dir.join("missing.txt.p2p-tmp").exists(),
+        "starting a pull should create a temp file"
+    );
+
+    let response = SyncResponse::NotFound {
+        path: "/missing.txt".to_string(),
+    };
+
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, response)
+        .await
+        .expect("not found should cancel cleanly");
+
+    assert!(follow_up.is_none());
+    assert!(
+        !state.is_pending(peer, "/missing.txt"),
+        "transfer should be removed from pending state"
+    );
+    assert!(
+        !data_dir.join("missing.txt.p2p-tmp").exists(),
+        "temp file should be removed when the peer reports the file missing"
+    );
 
     fs::remove_dir_all(&sqlite_dir).ok();
     fs::remove_dir_all(&data_dir).ok();

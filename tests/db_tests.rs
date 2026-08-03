@@ -298,15 +298,17 @@ async fn manifest_includes_existing_files_and_directories_without_prior_events()
 
 #[tokio::test]
 async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
-    let base_dir = temp_dir("db-manifest");
-    let sqlite_path = base_dir.join("webdav.db");
+    let sqlite_dir = temp_dir("db-manifest-sqlite");
+    let data_dir = temp_dir("db-manifest-data");
+    let sqlite_path = sqlite_dir.join("webdav.db");
     let keep_content = b"keep me around";
 
-    fs::create_dir_all(&base_dir).expect("temp dir should exist");
-    fs::write(base_dir.join("keep.txt"), keep_content).expect("keep.txt should be created");
-    fs::write(base_dir.join("gone.txt"), b"will be deleted").expect("gone.txt should be created");
+    fs::create_dir_all(&sqlite_dir).expect("sqlite dir should exist");
+    fs::create_dir_all(&data_dir).expect("data dir should exist");
+    fs::write(data_dir.join("keep.txt"), keep_content).expect("keep.txt should be created");
+    fs::write(data_dir.join("gone.txt"), b"will be deleted").expect("gone.txt should be created");
 
-    let database = open_database(&base_dir, &base_dir).await;
+    let database = open_database(&sqlite_dir, &data_dir).await;
 
     database.record(EventEnvelope {
         event_kind: EventKind::Created,
@@ -336,7 +338,7 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
         resource_count == 2
     });
 
-    fs::remove_file(base_dir.join("gone.txt")).expect("gone.txt should be removable");
+    fs::remove_file(data_dir.join("gone.txt")).expect("gone.txt should be removable");
     database.record(EventEnvelope {
         event_kind: EventKind::Deleted,
         source_path: "/gone.txt".to_string(),
@@ -359,9 +361,15 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
 
     let manifest = database.manifest().await.expect("manifest should be readable");
 
-    assert_eq!(manifest.resources.len(), 1);
-    let entry = &manifest.resources[0];
-    assert_eq!(entry.resource_path, "/keep.txt");
+    assert!(
+        manifest.resources.iter().all(|entry| entry.resource_path != "/gone.txt"),
+        "deleted resources should no longer appear as live manifest entries"
+    );
+    let entry = manifest
+        .resources
+        .iter()
+        .find(|entry| entry.resource_path == "/keep.txt")
+        .expect("keep.txt should remain in the live manifest");
     assert_eq!(entry.resource_kind, "file");
     assert_eq!(entry.size, keep_content.len() as u64);
     assert_eq!(entry.checksum.as_deref(), Some(sha256_hex(keep_content).as_str()));
@@ -369,5 +377,39 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
     assert_eq!(manifest.tombstones.len(), 1);
     assert_eq!(manifest.tombstones[0].resource_path, "/gone.txt");
 
-    fs::remove_dir_all(&base_dir).expect("temp dir should be removed");
+    fs::remove_dir_all(&sqlite_dir).expect("sqlite dir should be removed");
+    fs::remove_dir_all(&data_dir).expect("data dir should be removed");
+}
+
+#[tokio::test]
+async fn manifest_scan_ignores_sync_temp_files() {
+    let sqlite_dir = temp_dir("manifest-ignores-sync-temp-sqlite");
+    let data_dir = temp_dir("manifest-ignores-sync-temp-data");
+
+    fs::create_dir_all(data_dir.join("nested")).expect("nested dir should be created");
+    fs::write(data_dir.join("stable.txt"), b"stable").expect("stable file should be written");
+    fs::write(data_dir.join("ghost.txt.p2p-tmp"), b"ghost").expect("tmp file should be written");
+    fs::write(
+        data_dir.join("nested/ghost.txt.p2p-tmp.p2p-tmp"),
+        b"ghost nested",
+    )
+    .expect("nested tmp file should be written");
+
+    let database = open_database(&sqlite_dir, &data_dir).await;
+    let manifest = database.manifest().await.expect("manifest should be readable");
+
+    assert!(
+        manifest.resources.iter().any(|entry| entry.resource_path == "/stable.txt"),
+        "regular files should remain visible in the manifest"
+    );
+    assert!(
+        manifest
+            .resources
+            .iter()
+            .all(|entry| !entry.resource_path.contains(".p2p-tmp")),
+        "sync temp files must never be advertised in manifests"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
 }

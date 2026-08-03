@@ -229,6 +229,15 @@ impl SyncState {
         self.pending.contains_key(&(peer, path.to_string()))
     }
 
+    async fn cancel(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
+        if let Some(transfer) = self.pending.remove(&(peer, path.to_string())) {
+            drop(transfer.file);
+            let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
+        }
+
+        Ok(())
+    }
+
     /// Begins a chunked pull of `resource_path` (written to `destination_path`
     /// if given, otherwise to `resource_path` itself) from `peer`. No-op if a
     /// pull for the same (peer, path) is already in flight.
@@ -352,12 +361,6 @@ impl SyncState {
 
         Ok(None)
     }
-
-    /// Drops a pending transfer because the peer reported it no longer has
-    /// the file (deleted concurrently, for example).
-    fn cancel(&mut self, peer: PeerId, path: &str) {
-        self.pending.remove(&(peer, path.to_string()));
-    }
 }
 
 async fn checksum_file(path: &Path) -> io::Result<String> {
@@ -457,7 +460,7 @@ pub async fn handle_chunk_response(
         } => state.on_chunk(database, peer, path, data, offset, is_last).await,
         SyncResponse::NotFound { path } => {
             println!("sync: peer {peer} no longer has {path}; dropping pending transfer");
-            state.cancel(peer, &path);
+            state.cancel(peer, &path).await?;
             Ok(None)
         }
         SyncResponse::Manifest(_) | SyncResponse::Ack => Ok(None),
