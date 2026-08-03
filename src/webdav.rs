@@ -110,6 +110,21 @@ fn destination_path(destination: &str) -> &str {
     destination
 }
 
+fn normalize_destination(destination: &str) -> String {
+    let path = destination_path(destination)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/");
+
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// Returns the parent directory portion of an absolute path.
 /// `/a/b/c` → `/a/b`, `/file.txt` → `/`, `/` → `/`.
 fn parent_path(path: &str) -> &str {
@@ -322,7 +337,7 @@ pub async fn run_server(
                                     .headers()
                                     .get("Destination")
                                     .and_then(|v| v.to_str().ok())
-                                    .map(|s| s.to_string());
+                                    .map(normalize_destination);
 
                                 let authorized = is_authorized(req.headers(), &username, &password, &method);
 

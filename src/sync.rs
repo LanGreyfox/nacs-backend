@@ -136,6 +136,26 @@ fn latest_states(manifest: &db::Manifest) -> HashMap<String, (String, PathState)
     map
 }
 
+fn normalize_wire_path(path: &str) -> String {
+    let path = if let Some(after) = path.strip_prefix("http://") {
+        after.find('/').map(|i| &after[i..]).unwrap_or("/")
+    } else if let Some(after) = path.strip_prefix("https://") {
+        after.find('/').map(|i| &after[i..]).unwrap_or("/")
+    } else {
+        path
+    };
+
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// Compares two manifests and returns the actions the *local* node should
 /// take. Only considers paths where the remote's latest known state (live
 /// resource or tombstone) is newer than the local one — the symmetric
@@ -456,13 +476,19 @@ pub async fn handle_incoming_event(
     peer: PeerId,
     event: FileChangeEvent,
 ) -> io::Result<Option<SyncRequest>> {
+    let source_path = normalize_wire_path(&event.source_path);
+    let destination_path = event
+        .destination_path
+        .as_deref()
+        .map(normalize_wire_path);
+
     match event.event_kind {
         EventKind::Deleted => {
-            println!("sync: apply remote delete {}", event.source_path);
-            apply_delete(data_dir, &event.source_path).await?;
+            println!("sync: apply remote delete {}", source_path);
+            apply_delete(data_dir, &source_path).await?;
             database.record(EventEnvelope {
                 event_kind: EventKind::Deleted,
-                source_path: event.source_path,
+                source_path,
                 destination_path: None,
                 method: "P2P".to_string(),
                 status_code: 200,
@@ -471,12 +497,12 @@ pub async fn handle_incoming_event(
             Ok(None)
         }
         EventKind::DirCreated => {
-            let rel = event.source_path.trim_start_matches('/');
+            let rel = source_path.trim_start_matches('/');
             println!("sync: create remote directory {}", data_dir.join(rel).display());
             tokio::fs::create_dir_all(data_dir.join(rel)).await?;
             database.record(EventEnvelope {
                 event_kind: EventKind::DirCreated,
-                source_path: event.source_path,
+                source_path,
                 destination_path: None,
                 method: "P2P".to_string(),
                 status_code: 200,
@@ -485,11 +511,8 @@ pub async fn handle_incoming_event(
             Ok(None)
         }
         EventKind::Renamed | EventKind::Moved => {
-            let dest = event
-                .destination_path
-                .clone()
-                .unwrap_or_else(|| event.source_path.clone());
-            let src_fs = data_dir.join(event.source_path.trim_start_matches('/'));
+            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let src_fs = data_dir.join(source_path.trim_start_matches('/'));
             let dest_fs = data_dir.join(dest.trim_start_matches('/'));
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
@@ -501,8 +524,8 @@ pub async fn handle_incoming_event(
                 tokio::fs::rename(&src_fs, &dest_fs).await?;
                 database.record(EventEnvelope {
                     event_kind: event.event_kind,
-                    source_path: event.source_path,
-                    destination_path: event.destination_path,
+                    source_path,
+                    destination_path,
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: event.username,
@@ -527,11 +550,8 @@ pub async fn handle_incoming_event(
             }
         }
         EventKind::Copied => {
-            let dest = event
-                .destination_path
-                .clone()
-                .unwrap_or_else(|| event.source_path.clone());
-            let src_fs = data_dir.join(event.source_path.trim_start_matches('/'));
+            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let src_fs = data_dir.join(source_path.trim_start_matches('/'));
             let dest_fs = data_dir.join(dest.trim_start_matches('/'));
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
@@ -543,8 +563,8 @@ pub async fn handle_incoming_event(
                 tokio::fs::copy(&src_fs, &dest_fs).await?;
                 database.record(EventEnvelope {
                     event_kind: EventKind::Copied,
-                    source_path: event.source_path,
-                    destination_path: event.destination_path,
+                    source_path,
+                    destination_path,
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: event.username,
@@ -569,7 +589,7 @@ pub async fn handle_incoming_event(
             }
         }
         EventKind::Created | EventKind::Edited => {
-            let path = event.source_path.clone();
+            let path = source_path;
             if state.is_pending(peer, &path) {
                 Ok(None)
             } else {

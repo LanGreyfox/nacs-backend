@@ -329,6 +329,88 @@ fn moved_both_tombstoned_is_a_no_op() {
     assert!(diff_manifests(&local, &remote).is_empty());
 }
 
+#[tokio::test]
+async fn incoming_move_event_with_absolute_destination_url_renames_to_relative_target() {
+    let sqlite_dir = temp_dir("sync-move-abs-dest-sqlite");
+    let data_dir = temp_dir("sync-move-abs-dest-data");
+    fs::create_dir_all(data_dir.join("old")).expect("old directory should exist");
+    fs::write(data_dir.join("old/file.txt"), b"move me").expect("source file should exist");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Moved,
+        source_path: "/old/file.txt".to_string(),
+        destination_path: Some("http://127.0.0.1:4918/new/file.txt".to_string()),
+        checksum: None,
+        size: 0,
+        username: "peer:test".to_string(),
+    };
+
+    let request = sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+        .await
+        .expect("handling move event should succeed");
+
+    assert!(request.is_none(), "local rename should not trigger a pull");
+    assert!(
+        !data_dir.join("old/file.txt").exists(),
+        "source file should have been moved"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("new/file.txt")).expect("destination file should exist"),
+        b"move me"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn incoming_copy_event_with_absolute_destination_url_copies_to_relative_target() {
+    let sqlite_dir = temp_dir("sync-copy-abs-dest-sqlite");
+    let data_dir = temp_dir("sync-copy-abs-dest-data");
+    fs::create_dir_all(data_dir.join("old")).expect("old directory should exist");
+    fs::write(data_dir.join("old/file.txt"), b"copy me").expect("source file should exist");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Copied,
+        source_path: "/old/file.txt".to_string(),
+        destination_path: Some("http://127.0.0.1:4918/new/file.txt".to_string()),
+        checksum: None,
+        size: 0,
+        username: "peer:test".to_string(),
+    };
+
+    let request = sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+        .await
+        .expect("handling copy event should succeed");
+
+    assert!(request.is_none(), "local copy should not trigger a pull");
+    assert_eq!(
+        fs::read(data_dir.join("old/file.txt")).expect("source file should remain"),
+        b"copy me"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("new/file.txt")).expect("destination file should exist"),
+        b"copy me"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
 // --- Chunked transfer state machine (finalize + checksum verification) ---
 
 #[tokio::test]
