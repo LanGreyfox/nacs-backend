@@ -41,14 +41,14 @@ You can override host and port with environment variables:
 
 ## Authentication
 
-This server enforces HTTP Basic Authentication. Credentials are read from environment variables at startup:
+This server enforces HTTP Basic Authentication for WebDAV requests. Credentials are read from environment variables at startup:
 
 - `WEBDAV_USER` — username
 - `WEBDAV_PASS` — password
 
-The server expects the environment variables to be set; it will exit with an error if they are missing.
+The server expects these variables to be set; it exits with an error if either is missing.
 
-The server also allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
+The server allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
 
 ## Persistence
 
@@ -66,6 +66,7 @@ Each stored record includes the current folder, whether the resource is a file o
 
 - Discovery uses mDNS on the local network.
 - Transport uses TCP with Noise encryption and Yamux multiplexing.
+- The transport is encrypted, but peers are not yet mutually authenticated.
 - Swarm idle timeout is set to 60 seconds.
 - Ping heartbeat runs every 10 seconds with an 8-second timeout.
 - A custom keepalive behaviour is enabled so established connections stay open even though ping streams are excluded from keepalive in this libp2p version.
@@ -151,6 +152,7 @@ Linux Dolphin example URL:
 - SQLite writes are handled by a dedicated background worker, so the WebDAV request path stays responsive.
 - Checksum values are computed for files and stored in the database.
 - P2P sync currently replicates file and folder state by exchanging manifests and pulling content only when needed.
+- For P2P, encryption is enabled at the transport layer, but mutual peer authentication is still a planned enhancement.
 - If you prefer a different behavior (for example: allow missing credentials, read from a config file, or support multiple users), I can update the implementation accordingly.
 
 ## License

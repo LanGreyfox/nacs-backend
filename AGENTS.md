@@ -54,8 +54,10 @@
 ✅ SQLite File: ./sqlite/webdav.db
 ✅ P2P Identity File: ./sqlite/p2p_identity.key for port 4001; ./sqlite/p2p_identity-<port>.key for other P2P ports (auto-created)
 ✅ Lock System: FakeLs (for simple tests)
+✅ WebDAV Auth: HTTP Basic Auth with WEBDAV_USER / WEBDAV_PASS
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
+✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1
 ✅ P2P Sync Chunking: 256 KiB pull-based file transfers with checksum verification
 ✅ Swarm Idle Timeout: 60 seconds
@@ -71,6 +73,7 @@
 - [x] Async event loop with Tokio
 - [x] Auto-creation of data directories
 - [x] SQLite persistence with background worker
+- [x] WebDAV Basic Auth enforcement
 - [x] P2P peer discovery with libp2p (mDNS)
 - [x] Encrypted P2P transport (Noise + Yamux)
 - [x] P2P identity management and persistence
@@ -88,7 +91,7 @@
 1. **P2P Content Replication** – Sync files across peers via P2P network
 2. **Connection Pooling** – For SQLite database, if concurrency grows beyond the current single-worker model
 3. **Error Handling** – Improve error logging with context
-4. **Authentication** – Add JWT or Basic Auth to WebDAV and P2P
+4. **Authentication** – Add mutual P2P authentication (shared secret or certificates) and stronger access control
 5. **Configuration Externalization** – With `.env` file for ports and paths
 6. **Health Checks** – Implement `/health` endpoint
 7. **P2P Event Broadcasting** – Notify peers of file changes in real-time
@@ -131,6 +134,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 
 **P2P Features:**
 - **Transport:** TCP with Noise encryption + Yamux multiplexing
+- **Authentication:** encrypted transport is enabled, but mutual peer authentication is not implemented yet
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
@@ -167,7 +171,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-07-29 (P2P sync protocol + chunked file replication update) |
+| **Last Updated** | 2026-08-04 (WebDAV auth + current P2P security documentation update) |
 | **Status** | ✅ Active project info for future interactions |
 | **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
 
