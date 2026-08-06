@@ -163,6 +163,20 @@ fn diff_manifests_ignores_older_or_equal_remote_file() {
 }
 
 #[test]
+fn diff_manifests_ignores_newer_remote_file_when_checksum_matches() {
+    let local = Manifest {
+        resources: vec![manifest_entry("/a.txt", "abc123", "2024-01-01T00:00:00Z")],
+        tombstones: vec![],
+    };
+    let remote = Manifest {
+        resources: vec![manifest_entry("/a.txt", "abc123", "2024-01-02T00:00:00Z")],
+        tombstones: vec![],
+    };
+
+    assert!(diff_manifests(&local, &remote).is_empty());
+}
+
+#[test]
 fn diff_manifests_creates_missing_remote_folder() {
     let local = Manifest::default();
     let remote = Manifest {

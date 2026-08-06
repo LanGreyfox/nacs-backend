@@ -107,7 +107,6 @@ pub enum SyncAction {
 enum PathState {
     Live {
         resource_kind: String,
-        #[allow(dead_code)]
         checksum: Option<String>,
     },
     Deleted,
@@ -167,7 +166,34 @@ pub fn diff_manifests(local: &db::Manifest, remote: &db::Manifest) -> Vec<SyncAc
 
     let mut actions = Vec::new();
     for (path, (remote_ts, remote_state)) in &remote_states {
-        let is_remote_newer = match local_states.get(path) {
+        let local_state = local_states.get(path);
+
+        // If both sides already report the same file checksum, skip timestamp-based
+        // reconciliation to prevent repeated transfers caused by clock/mtime drift.
+        if let (
+            PathState::Live {
+                resource_kind: remote_kind,
+                checksum: remote_checksum,
+            },
+            Some((
+                _,
+                PathState::Live {
+                    resource_kind: local_kind,
+                    checksum: local_checksum,
+                },
+            )),
+        ) = (remote_state, local_state)
+        {
+            if remote_kind == "file"
+                && local_kind == "file"
+                && remote_checksum.is_some()
+                && remote_checksum == local_checksum
+            {
+                continue;
+            }
+        }
+
+        let is_remote_newer = match local_state {
             Some((local_ts, _)) => remote_ts > local_ts,
             None => true,
         };
