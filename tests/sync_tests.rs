@@ -672,3 +672,146 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
     fs::remove_dir_all(&sqlite_dir).ok();
     fs::remove_dir_all(&data_dir).ok();
 }
+
+#[tokio::test]
+async fn cancel_peer_removes_pending_transfer_and_temp_file() {
+    let sqlite_dir = temp_dir("sync-cancel-peer-sqlite");
+    let data_dir = temp_dir("sync-cancel-peer-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+
+    let content = b"partial transfer content";
+    let checksum = sha256_hex(content);
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/disconnect.txt".to_string(),
+        destination_path: None,
+        checksum: Some(checksum),
+        size: content.len() as u64,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+        .await
+        .expect("handling the event should succeed");
+
+    let chunk_response = SyncResponse::Chunk {
+        path: "/disconnect.txt".to_string(),
+        data: content[..8].to_vec(),
+        offset: 0,
+        total_size: content.len() as u64,
+        is_last: false,
+    };
+
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, chunk_response)
+        .await
+        .expect("chunk handling should succeed");
+
+    assert!(follow_up.is_some(), "transfer should still be pending after first chunk");
+    assert!(state.is_pending(peer, "/disconnect.txt"));
+    assert!(data_dir.join("disconnect.txt.p2p-tmp").exists());
+
+    state
+        .cancel_peer(peer)
+        .await
+        .expect("peer cancellation should succeed");
+
+    assert!(!state.is_pending(peer, "/disconnect.txt"));
+    assert!(
+        !data_dir.join("disconnect.txt.p2p-tmp").exists(),
+        "temp file should be removed when the peer disconnects"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
+    let sqlite_dir = temp_dir("sync-cancel-multi-sqlite");
+    let data_dir = temp_dir("sync-cancel-multi-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+
+    let first_part = b"first-half-".to_vec();
+    let second_part = b"second-half".to_vec();
+    let mut full_content = first_part.clone();
+    full_content.extend_from_slice(&second_part);
+    let checksum = sha256_hex(&full_content);
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/multi-disconnect.txt".to_string(),
+        destination_path: None,
+        checksum: Some(checksum),
+        size: full_content.len() as u64,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+        .await
+        .expect("handling the event should succeed");
+
+    let first_chunk = SyncResponse::Chunk {
+        path: "/multi-disconnect.txt".to_string(),
+        data: first_part.clone(),
+        offset: 0,
+        total_size: full_content.len() as u64,
+        is_last: false,
+    };
+
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, first_chunk)
+        .await
+        .expect("chunk handling should succeed");
+
+    assert!(matches!(
+        follow_up,
+        Some(SyncRequest::FetchFile { path, offset }) if path == "/multi-disconnect.txt" && offset == first_part.len() as u64
+    ));
+    assert!(state.is_pending(peer, "/multi-disconnect.txt"));
+
+    state
+        .cancel_peer(peer)
+        .await
+        .expect("peer cancellation should succeed");
+
+    assert!(!state.is_pending(peer, "/multi-disconnect.txt"));
+    assert!(
+        !data_dir.join("multi-disconnect.txt.p2p-tmp").exists(),
+        "temp file should be removed when the peer disconnects"
+    );
+
+    let late_chunk = SyncResponse::Chunk {
+        path: "/multi-disconnect.txt".to_string(),
+        data: second_part,
+        offset: first_part.len() as u64,
+        total_size: full_content.len() as u64,
+        is_last: true,
+    };
+
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, late_chunk)
+        .await
+        .expect("late chunk should be ignored cleanly");
+
+    assert!(follow_up.is_none());
+    assert!(
+        !data_dir.join("multi-disconnect.txt").exists(),
+        "late chunks must not materialize a file after disconnect"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}

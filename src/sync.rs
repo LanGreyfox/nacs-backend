@@ -255,6 +255,23 @@ impl SyncState {
         self.pending.contains_key(&(peer, path.to_string()))
     }
 
+    /// Cancels every in-flight transfer owned by `peer` and removes any temp
+    /// files left behind by partially received chunks.
+    pub async fn cancel_peer(&mut self, peer: PeerId) -> io::Result<()> {
+        let paths: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|(pending_peer, _)| *pending_peer == peer)
+            .map(|(_, path)| path.clone())
+            .collect();
+
+        for path in paths {
+            self.cancel(peer, &path).await?;
+        }
+
+        Ok(())
+    }
+
     async fn cancel(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
         if let Some(transfer) = self.pending.remove(&(peer, path.to_string())) {
             drop(transfer.file);

@@ -342,6 +342,9 @@ pub async fn run_discovery(
                         connected_peers.remove(&peer_id);
                         dialing_peers.remove(&peer_id);
                         seen_peers.insert(peer_id);
+                        if let Err(err) = sync_state.cancel_peer(peer_id).await {
+                            eprintln!("failed to cancel pending sync transfers for {peer_id}: {err}");
+                        }
                         match cause {
                             Some(ConnectionError::KeepAliveTimeout) => {
                                 eprintln!("peer disconnected: {peer_id} (keepalive timeout expired - no protocol requested connection keep-alive)")
