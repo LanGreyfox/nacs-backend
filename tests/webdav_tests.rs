@@ -5,8 +5,11 @@ use std::{
 };
 
 use hyper::{Method, StatusCode};
+use nacs_backend::db::EventKind;
+use nacs_backend::sync::P2pHandle;
 use nacs_backend::webdav::{
-    build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials, FileEvent,
+    build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials,
+    spawn_p2p_announcement, FileEvent,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -258,4 +261,60 @@ fn unauthorized_options_response_includes_dav_capability_headers() {
             .and_then(|v| v.to_str().ok()),
         Some("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK")
     );
+}
+
+#[tokio::test]
+async fn spawn_p2p_announcement_computes_checksum_in_background() {
+    let data_dir = temp_dir("spawn-p2p-announcement");
+    fs::create_dir_all(&data_dir).expect("temp dir should be created");
+    fs::write(data_dir.join("report.txt"), b"hello webdav")
+        .expect("test file should be written");
+
+    let (p2p, mut rx) = P2pHandle::channel();
+    let handle = spawn_p2p_announcement(
+        EventKind::Created,
+        "/report.txt".to_string(),
+        None,
+        "user".to_string(),
+        data_dir.clone(),
+        "/report.txt".to_string(),
+        p2p,
+    );
+
+    handle.await.expect("background task should complete");
+    let event = rx.recv().await.expect("announcement should be queued");
+
+    assert_eq!(event.event_kind, EventKind::Created);
+    assert_eq!(event.source_path, "/report.txt");
+    assert_eq!(event.destination_path, None);
+    assert_eq!(event.size, 12);
+    assert!(event.checksum.is_some());
+
+    fs::remove_dir_all(&data_dir).expect("temp dir should be removed");
+}
+
+#[tokio::test]
+async fn spawn_p2p_announcement_falls_back_when_file_is_missing() {
+    let data_dir = temp_dir("spawn-p2p-announcement-missing");
+    fs::create_dir_all(&data_dir).expect("temp dir should be created");
+
+    let (p2p, mut rx) = P2pHandle::channel();
+    let handle = spawn_p2p_announcement(
+        EventKind::Deleted,
+        "/missing.txt".to_string(),
+        None,
+        "user".to_string(),
+        data_dir.clone(),
+        "/missing.txt".to_string(),
+        p2p,
+    );
+
+    handle.await.expect("background task should complete");
+    let event = rx.recv().await.expect("announcement should be queued");
+
+    assert_eq!(event.event_kind, EventKind::Deleted);
+    assert_eq!(event.size, 0);
+    assert_eq!(event.checksum, None);
+
+    fs::remove_dir_all(&data_dir).expect("temp dir should be removed");
 }

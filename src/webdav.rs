@@ -1,4 +1,4 @@
-use std::{convert::Infallible, io, net::SocketAddr, path::Path};
+use std::{convert::Infallible, io, net::SocketAddr, path::{Path, PathBuf}};
 
 use crate::db::{file_checksum_and_size, Database, EventEnvelope, EventKind};
 use crate::sync::{FileChangeEvent, P2pHandle};
@@ -285,6 +285,33 @@ fn required_env_var(name: &str) -> io::Result<String> {
     })
 }
 
+#[doc(hidden)]
+pub fn spawn_p2p_announcement(
+    event_kind: EventKind,
+    source_path: String,
+    destination_path: Option<String>,
+    username: String,
+    data_dir: PathBuf,
+    final_path: String,
+    p2p: P2pHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let (checksum, size) = match file_checksum_and_size(&data_dir, &final_path) {
+            Ok(Some((checksum, size))) => (Some(checksum), size),
+            Ok(None) | Err(_) => (None, 0),
+        };
+
+        p2p.announce(FileChangeEvent {
+            event_kind,
+            source_path,
+            destination_path,
+            checksum,
+            size,
+            username,
+        });
+    })
+}
+
 pub async fn run_server(
     addr: SocketAddr,
     dir: impl AsRef<Path>,
@@ -366,9 +393,10 @@ pub async fn run_server(
                                 let status = response.status();
                                 let event = map_to_event(&method, status, &uri, destination.as_deref());
                                 if let Some(event_kind) = event_kind_for_storage(&event) {
+                                    let source_path = uri.path().to_string();
                                     database.record(EventEnvelope {
                                         event_kind,
-                                        source_path: uri.path().to_string(),
+                                        source_path: source_path.clone(),
                                         destination_path: destination.clone(),
                                         method: method.as_str().to_string(),
                                         status_code: status.as_u16(),
@@ -376,20 +404,16 @@ pub async fn run_server(
                                     });
 
                                     let final_path =
-                                        destination.clone().unwrap_or_else(|| uri.path().to_string());
-                                    let (checksum, size) =
-                                        match file_checksum_and_size(&data_dir, &final_path) {
-                                            Ok(Some((checksum, size))) => (Some(checksum), size),
-                                            Ok(None) | Err(_) => (None, 0),
-                                        };
-                                    p2p.announce(FileChangeEvent {
+                                        destination.clone().unwrap_or_else(|| source_path.clone());
+                                    spawn_p2p_announcement(
                                         event_kind,
-                                        source_path: uri.path().to_string(),
-                                        destination_path: destination.clone(),
-                                        checksum,
-                                        size,
-                                        username: username.clone(),
-                                    });
+                                        source_path,
+                                        destination.clone(),
+                                        username.clone(),
+                                        data_dir.clone(),
+                                        final_path,
+                                        p2p.clone(),
+                                    );
                                 }
                                 log_file_event(&event, &method, &uri, status, &user_agent);
 
