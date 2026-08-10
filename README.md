@@ -38,6 +38,7 @@ You can override host and port with environment variables:
 - `WEBDAV_HOST` — bind host/IP (default: `127.0.0.1`)
 - `WEBDAV_PORT` — bind port (default: `4918`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
+- `SYNC_CHUNK_SIZE_BYTES` — P2P sync chunk size in bytes (default: `2097152`, i.e. 2 MiB)
 
 ## Authentication
 
@@ -76,7 +77,8 @@ Each stored record includes the current folder, whether the resource is a file o
 - Nodes exchange a manifest that includes live resources and tombstones.
 - Sync decisions are made with last-write-wins timestamp comparison.
 - File contents are pulled on demand through `FetchFile` requests and `Chunk` responses.
-- Transfers are limited to 256 KiB per chunk and are verified with SHA-256 before the file is materialized locally.
+- Transfers are limited to 2 MiB per chunk by default and are verified with SHA-256 before the file is materialized locally.
+- You can tune chunk size via `SYNC_CHUNK_SIZE_BYTES`; invalid values fall back to the default with a warning.
 - The wire protocol uses libp2p request-response with CBOR encoding under `/nacs-backend/sync/1`.
 
 This keeps the sync path bounded in memory and avoids eager pushes of file bytes.

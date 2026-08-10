@@ -121,6 +121,38 @@ fn sync_request_and_response_round_trip_through_serde() {
     }
 }
 
+#[test]
+fn chunk_size_defaults_when_env_is_missing() {
+    assert_eq!(
+        sync::resolve_chunk_size_from_env(Err(std::env::VarError::NotPresent)),
+        sync::DEFAULT_CHUNK_SIZE
+    );
+}
+
+#[test]
+fn chunk_size_uses_valid_env_value() {
+    assert_eq!(
+        sync::resolve_chunk_size_from_env(Ok("4194304".to_string())),
+        4 * 1024 * 1024
+    );
+}
+
+#[test]
+fn chunk_size_falls_back_for_invalid_number() {
+    assert_eq!(
+        sync::resolve_chunk_size_from_env(Ok("not-a-number".to_string())),
+        sync::DEFAULT_CHUNK_SIZE
+    );
+}
+
+#[test]
+fn chunk_size_falls_back_for_zero() {
+    assert_eq!(
+        sync::resolve_chunk_size_from_env(Ok("0".to_string())),
+        sync::DEFAULT_CHUNK_SIZE
+    );
+}
+
 // --- diff_manifests reconciliation logic ---
 
 #[test]

@@ -13,8 +13,10 @@
 
 use std::{
     collections::HashMap,
+    env,
     io,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use libp2p::PeerId;
@@ -27,7 +29,52 @@ use tokio::{
 use crate::db::{self, Database, EventEnvelope, EventKind};
 
 /// Maximum number of bytes transferred per chunk request/response round trip.
-pub const CHUNK_SIZE: usize = 256 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+const SYNC_CHUNK_SIZE_ENV: &str = "SYNC_CHUNK_SIZE_BYTES";
+
+/// Returns the configured per-chunk transfer size in bytes.
+///
+/// This value is resolved once from `SYNC_CHUNK_SIZE_BYTES` at runtime and
+/// then cached for the process lifetime.
+pub fn configured_chunk_size() -> usize {
+    static CHUNK_SIZE: OnceLock<usize> = OnceLock::new();
+
+    *CHUNK_SIZE.get_or_init(|| {
+        let chunk_size = resolve_chunk_size_from_env(env::var(SYNC_CHUNK_SIZE_ENV));
+        println!(
+            "sync: configured chunk size = {chunk_size} bytes ({SYNC_CHUNK_SIZE_ENV})"
+        );
+        chunk_size
+    })
+}
+
+#[doc(hidden)]
+pub fn resolve_chunk_size_from_env(raw: Result<String, env::VarError>) -> usize {
+    match raw {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(0) => {
+                eprintln!(
+                    "sync: {SYNC_CHUNK_SIZE_ENV}=0 is invalid; using default {DEFAULT_CHUNK_SIZE} bytes"
+                );
+                DEFAULT_CHUNK_SIZE
+            }
+            Ok(size) => size,
+            Err(_) => {
+                eprintln!(
+                    "sync: invalid {SYNC_CHUNK_SIZE_ENV} value '{value}'; using default {DEFAULT_CHUNK_SIZE} bytes"
+                );
+                DEFAULT_CHUNK_SIZE
+            }
+        },
+        Err(env::VarError::NotPresent) => DEFAULT_CHUNK_SIZE,
+        Err(err) => {
+            eprintln!(
+                "sync: unable to read {SYNC_CHUNK_SIZE_ENV} ({err}); using default {DEFAULT_CHUNK_SIZE} bytes"
+            );
+            DEFAULT_CHUNK_SIZE
+        }
+    }
+}
 
 /// A lightweight, content-free description of a change that happened
 /// locally. Used both as the local channel message from the WebDAV layer to
@@ -453,12 +500,13 @@ pub async fn read_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncRespons
         }
     };
     let total_size = metadata.len();
+    let chunk_size = configured_chunk_size();
 
     let read_result: io::Result<Vec<u8>> = async {
         let mut file = tokio::fs::File::open(&fs_path).await?;
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let remaining = total_size.saturating_sub(offset);
-        let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
+        let to_read = remaining.min(chunk_size as u64) as usize;
         let mut buffer = vec![0_u8; to_read];
         file.read_exact(&mut buffer).await?;
         Ok(buffer)
