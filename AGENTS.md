@@ -59,7 +59,7 @@
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1
-✅ P2P Sync Chunking: 256 KiB pull-based file transfers with checksum verification
+✅ P2P Sync Chunking: default 2 MiB pull-based file transfers with checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
@@ -138,6 +138,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
+- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 2097152 bytes (2 MiB); invalid values warn and fall back to default
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
 - **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
@@ -156,6 +157,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | **Sync tests** | `cargo test --test sync_tests` |
 | **All tests** | `cargo test --all` |
 | **Set P2P Port** | `P2P_PORT=5001 cargo run` |
+| **Set sync chunk size** | `SYNC_CHUNK_SIZE_BYTES=4194304 cargo run` |
 
 ---
 
@@ -171,7 +173,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-08-04 (WebDAV auth + current P2P security documentation update) |
+| **Last Updated** | 2026-08-10 (sync chunk size configuration and current P2P documentation update) |
 | **Status** | ✅ Active project info for future interactions |
 | **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
 

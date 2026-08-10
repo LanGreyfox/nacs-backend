@@ -99,6 +99,7 @@ export WEBDAV_PASS="yourpassword"
 export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
 export P2P_PORT="4001"
+export SYNC_CHUNK_SIZE_BYTES="2097152"
 cargo run
 ```
 
@@ -111,19 +112,19 @@ Start three instances in separate terminals so each node has unique WebDAV and P
 Terminal 1:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Terminal 2:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Terminal 3:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Expected behavior:
