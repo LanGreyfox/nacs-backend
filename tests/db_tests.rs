@@ -280,6 +280,56 @@ async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
 }
 
 #[tokio::test]
+async fn checksum_is_computed_for_percent_encoded_webdav_path() {
+    let sqlite_dir = temp_dir("db-checksum-encoded-sqlite");
+    let data_dir = temp_dir("db-checksum-encoded-data");
+    let sqlite_path = sqlite_dir.join("webdav.db");
+    let content = b"encoded path checksum";
+
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    let file_name = "Traveller 2022 Core Rulebook eBook.pdf";
+    fs::write(data_dir.join(file_name), content).expect("test file should be created");
+
+    let database = open_database(&sqlite_dir, &data_dir).await;
+    database.record(EventEnvelope {
+        event_kind: EventKind::Created,
+        source_path: "/Traveller%202022%20Core%20Rulebook%20eBook.pdf".to_string(),
+        destination_path: None,
+        checksum: None,
+        method: "PUT".to_string(),
+        status_code: 201,
+        username: "bob".to_string(),
+    });
+
+    let expected_checksum = sha256_hex(content);
+
+    wait_for_condition(Duration::from_secs(2), || {
+        if !sqlite_path.exists() {
+            return false;
+        }
+        let conn = open_conn(&sqlite_path);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .expect("should query resource count");
+        count == 1
+    });
+
+    let conn = open_conn(&sqlite_path);
+    let checksum: Option<String> = conn
+        .query_row(
+            "SELECT checksum FROM resources WHERE resource_path = ?1",
+            ["/Traveller%202022%20Core%20Rulebook%20eBook.pdf"],
+            |row| row.get(0),
+        )
+        .expect("resource row should exist");
+
+    assert_eq!(checksum.as_deref(), Some(expected_checksum.as_str()));
+
+    fs::remove_dir_all(&sqlite_dir).expect("sqlite temp dir should be removed");
+    fs::remove_dir_all(&data_dir).expect("data temp dir should be removed");
+}
+
+#[tokio::test]
 async fn manifest_includes_existing_files_and_directories_without_prior_events() {
     let base_dir = temp_dir("db-manifest-scan");
     let data_dir = base_dir.join("data");

@@ -115,13 +115,55 @@ fn normalize_destination(destination: &str) -> String {
         .split(['?', '#'])
         .next()
         .unwrap_or("/");
+    let path = percent_decode_lossy(path);
 
     if path.is_empty() {
         "/".to_string()
     } else if path.starts_with('/') {
-        path.to_string()
+        path
     } else {
         format!("/{path}")
+    }
+}
+
+fn normalize_request_path(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let path = percent_decode_lossy(path);
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -156,7 +198,8 @@ pub fn map_to_event(
         },
         "MOVE" => match status {
             StatusCode::CREATED | StatusCode::NO_CONTENT => {
-                let src_parent = parent_path(uri.path());
+                let normalized_src = normalize_request_path(uri.path());
+                let src_parent = parent_path(&normalized_src);
                 let is_rename = destination
                     .map(|dest| parent_path(destination_path(dest)) == src_parent)
                     .unwrap_or(false);
@@ -406,7 +449,7 @@ pub async fn run_server(
                                 let status = response.status();
                                 let event = map_to_event(&method, status, &uri, destination.as_deref());
                                 if let Some(event_kind) = event_kind_for_storage(&event) {
-                                    let source_path = uri.path().to_string();
+                                    let source_path = normalize_request_path(uri.path());
                                     let final_path =
                                         destination.clone().unwrap_or_else(|| source_path.clone());
                                     let should_hash = matches!(

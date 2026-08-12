@@ -706,6 +706,36 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
 }
 
 #[tokio::test]
+async fn read_chunk_handles_percent_encoded_path() {
+    let data_dir = temp_dir("sync-read-chunk-percent-encoded");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let content = b"pdf bytes";
+    fs::write(
+        data_dir.join("Traveller 2022 Core Rulebook eBook.pdf"),
+        content,
+    )
+    .expect("test file should be created");
+
+    let response = sync::read_chunk(
+        &data_dir,
+        "/Traveller%202022%20Core%20Rulebook%20eBook.pdf",
+        0,
+    )
+    .await;
+
+    match response {
+        SyncResponse::Chunk { data, is_last, .. } => {
+            assert_eq!(data, content);
+            assert!(is_last);
+        }
+        other => panic!("expected chunk response, got {other:?}"),
+    }
+
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
 async fn cancel_peer_removes_pending_transfer_and_temp_file() {
     let sqlite_dir = temp_dir("sync-cancel-peer-sqlite");
     let data_dir = temp_dir("sync-cancel-peer-data");

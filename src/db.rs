@@ -324,9 +324,39 @@ fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manife
 }
 
 fn file_size(data_dir: &Path, webdav_path: &str) -> io::Result<u64> {
-    let rel = webdav_path.trim_start_matches('/');
+    let decoded = percent_decode_lossy(webdav_path);
+    let rel = decoded.trim_start_matches('/');
     let metadata = fs::metadata(data_dir.join(rel))?;
     Ok(metadata.len())
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn is_sync_temp_path(path: &Path) -> bool {
@@ -709,7 +739,8 @@ pub(crate) fn file_checksum_and_size(
     data_dir: &Path,
     webdav_path: &str,
 ) -> io::Result<Option<(String, u64)>> {
-    let rel = webdav_path.trim_start_matches('/');
+    let decoded = percent_decode_lossy(webdav_path);
+    let rel = decoded.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
     let mut file = fs::File::open(&fs_path)?;
     let mut hasher = Sha256::new();

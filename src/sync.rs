@@ -192,14 +192,50 @@ fn normalize_wire_path(path: &str) -> String {
     };
 
     let path = path.split(['?', '#']).next().unwrap_or("/");
+    let path = percent_decode_lossy(path);
 
     if path.is_empty() {
         "/".to_string()
     } else if path.starts_with('/') {
-        path.to_string()
+        path
     } else {
         format!("/{path}")
     }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn fs_path_from_wire_path(data_dir: &Path, path: &str) -> PathBuf {
+    let decoded = percent_decode_lossy(path);
+    let rel = decoded.trim_start_matches('/');
+    data_dir.join(rel)
 }
 
 /// Compares two manifests and returns the actions the *local* node should
@@ -347,8 +383,7 @@ impl SyncState {
         }
 
         let target_path = destination_path.as_deref().unwrap_or(&resource_path);
-        let rel = target_path.trim_start_matches('/');
-        let final_path = data_dir.join(rel);
+        let final_path = fs_path_from_wire_path(data_dir, target_path);
         println!("sync: start pull for {resource_path} from peer {peer} -> {}", final_path.display());
         if let Some(parent) = final_path.parent() {
             println!("sync: ensure parent directory {}", parent.display());
@@ -464,8 +499,7 @@ async fn checksum_file(path: &Path) -> io::Result<String> {
 }
 
 async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
-    let rel = path.trim_start_matches('/');
-    let fs_path = data_dir.join(rel);
+    let fs_path = fs_path_from_wire_path(data_dir, path);
     println!("sync: delete {}", fs_path.display());
     match tokio::fs::metadata(&fs_path).await {
         Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&fs_path).await,
@@ -480,8 +514,7 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
 /// and reported to the peer as [`SyncResponse::NotFound`] so the request
 /// always gets a response.
 pub async fn read_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
-    let rel = path.trim_start_matches('/');
-    let fs_path = data_dir.join(rel);
+    let fs_path = fs_path_from_wire_path(data_dir, path);
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
         Err(err) => {
@@ -586,9 +619,9 @@ pub async fn handle_incoming_event(
             Ok(None)
         }
         EventKind::DirCreated => {
-            let rel = source_path.trim_start_matches('/');
-            println!("sync: create remote directory {}", data_dir.join(rel).display());
-            tokio::fs::create_dir_all(data_dir.join(rel)).await?;
+            let dir_path = fs_path_from_wire_path(data_dir, &source_path);
+            println!("sync: create remote directory {}", dir_path.display());
+            tokio::fs::create_dir_all(dir_path).await?;
             database.record(EventEnvelope {
                 event_kind: EventKind::DirCreated,
                 source_path,
@@ -602,8 +635,8 @@ pub async fn handle_incoming_event(
         }
         EventKind::Renamed | EventKind::Moved => {
             let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
-            let src_fs = data_dir.join(source_path.trim_start_matches('/'));
-            let dest_fs = data_dir.join(dest.trim_start_matches('/'));
+            let src_fs = fs_path_from_wire_path(data_dir, &source_path);
+            let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
                 if let Some(parent) = dest_fs.parent() {
@@ -642,8 +675,8 @@ pub async fn handle_incoming_event(
         }
         EventKind::Copied => {
             let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
-            let src_fs = data_dir.join(source_path.trim_start_matches('/'));
-            let dest_fs = data_dir.join(dest.trim_start_matches('/'));
+            let src_fs = fs_path_from_wire_path(data_dir, &source_path);
+            let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
             if tokio::fs::try_exists(&src_fs).await.unwrap_or(false) {
                 if let Some(parent) = dest_fs.parent() {
@@ -719,9 +752,9 @@ pub async fn apply_manifest_actions(
     for action in actions {
         match action {
             SyncAction::CreateDir { path } => {
-                let rel = path.trim_start_matches('/');
-                println!("sync: create dir {}", data_dir.join(rel).display());
-                if let Err(err) = tokio::fs::create_dir_all(data_dir.join(rel)).await {
+                let dir_path = fs_path_from_wire_path(data_dir, &path);
+                println!("sync: create dir {}", dir_path.display());
+                if let Err(err) = tokio::fs::create_dir_all(dir_path).await {
                     eprintln!("sync: failed to create directory {path}: {err}");
                     continue;
                 }
