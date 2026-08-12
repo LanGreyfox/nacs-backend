@@ -43,6 +43,7 @@ pub struct EventEnvelope {
     pub event_kind: EventKind,
     pub source_path: String,
     pub destination_path: Option<String>,
+    pub checksum: Option<String>,
     pub method: String,
     pub status_code: u16,
     pub username: String,
@@ -425,7 +426,10 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
     let mut checksum = if resource_kind == ResourceKind::Folder {
         None
     } else {
-        compute_checksum(data_dir, &final_path).ok().flatten()
+        event
+            .checksum
+            .clone()
+            .or_else(|| compute_checksum(data_dir, &final_path).ok().flatten())
     };
 
     let mut archive_resource_id = None;

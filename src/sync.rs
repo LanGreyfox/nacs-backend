@@ -400,11 +400,6 @@ impl SyncState {
             None => return Ok(None),
         };
 
-        println!(
-            "sync: write chunk for {} from peer {peer} at offset {offset} ({} bytes)",
-            path,
-            data.len()
-        );
         transfer.file.write_all(&data).await?;
 
         if !is_last {
@@ -444,6 +439,7 @@ impl SyncState {
             event_kind: transfer.event_kind,
             source_path: transfer.resource_path,
             destination_path: transfer.destination_path,
+            checksum: Some(actual_checksum),
             method: "P2P".to_string(),
             status_code: 200,
             username: transfer.username,
@@ -486,8 +482,6 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
 pub async fn read_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
     let rel = path.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
-    println!("sync: serve chunk request for {path} at offset {offset} from {}", fs_path.display());
-
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
         Err(err) => {
@@ -584,6 +578,7 @@ pub async fn handle_incoming_event(
                 event_kind: EventKind::Deleted,
                 source_path,
                 destination_path: None,
+                checksum: None,
                 method: "P2P".to_string(),
                 status_code: 200,
                 username: event.username,
@@ -598,6 +593,7 @@ pub async fn handle_incoming_event(
                 event_kind: EventKind::DirCreated,
                 source_path,
                 destination_path: None,
+                checksum: None,
                 method: "P2P".to_string(),
                 status_code: 200,
                 username: event.username,
@@ -620,6 +616,7 @@ pub async fn handle_incoming_event(
                     event_kind: event.event_kind,
                     source_path,
                     destination_path,
+                    checksum: event.checksum.clone(),
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: event.username,
@@ -659,6 +656,7 @@ pub async fn handle_incoming_event(
                     event_kind: EventKind::Copied,
                     source_path,
                     destination_path,
+                    checksum: event.checksum.clone(),
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: event.username,
@@ -731,6 +729,7 @@ pub async fn apply_manifest_actions(
                     event_kind: EventKind::DirCreated,
                     source_path: path,
                     destination_path: None,
+                    checksum: None,
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: username.clone(),
@@ -746,6 +745,7 @@ pub async fn apply_manifest_actions(
                     event_kind: EventKind::Deleted,
                     source_path: path,
                     destination_path: None,
+                    checksum: None,
                     method: "P2P".to_string(),
                     status_code: 200,
                     username: username.clone(),

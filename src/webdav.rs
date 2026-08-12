@@ -291,8 +291,11 @@ pub fn spawn_p2p_announcement(
     source_path: String,
     destination_path: Option<String>,
     username: String,
+    method: String,
+    status_code: u16,
     data_dir: PathBuf,
     final_path: String,
+    database: Database,
     p2p: P2pHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
@@ -300,6 +303,16 @@ pub fn spawn_p2p_announcement(
             Ok(Some((checksum, size))) => (Some(checksum), size),
             Ok(None) | Err(_) => (None, 0),
         };
+
+        database.record(EventEnvelope {
+            event_kind,
+            source_path: source_path.clone(),
+            destination_path: destination_path.clone(),
+            checksum: checksum.clone(),
+            method,
+            status_code,
+            username: username.clone(),
+        });
 
         p2p.announce(FileChangeEvent {
             event_kind,
@@ -394,26 +407,50 @@ pub async fn run_server(
                                 let event = map_to_event(&method, status, &uri, destination.as_deref());
                                 if let Some(event_kind) = event_kind_for_storage(&event) {
                                     let source_path = uri.path().to_string();
-                                    database.record(EventEnvelope {
-                                        event_kind,
-                                        source_path: source_path.clone(),
-                                        destination_path: destination.clone(),
-                                        method: method.as_str().to_string(),
-                                        status_code: status.as_u16(),
-                                        username: username.clone(),
-                                    });
-
                                     let final_path =
                                         destination.clone().unwrap_or_else(|| source_path.clone());
-                                    spawn_p2p_announcement(
+                                    let should_hash = matches!(
                                         event_kind,
-                                        source_path,
-                                        destination.clone(),
-                                        username.clone(),
-                                        data_dir.clone(),
-                                        final_path,
-                                        p2p.clone(),
+                                        EventKind::Created
+                                            | EventKind::Edited
+                                            | EventKind::Renamed
+                                            | EventKind::Moved
+                                            | EventKind::Copied
                                     );
+
+                                    if should_hash {
+                                        spawn_p2p_announcement(
+                                            event_kind,
+                                            source_path,
+                                            destination.clone(),
+                                            username.clone(),
+                                            method.as_str().to_string(),
+                                            status.as_u16(),
+                                            data_dir.clone(),
+                                            final_path,
+                                            database.clone(),
+                                            p2p.clone(),
+                                        );
+                                    } else {
+                                        database.record(EventEnvelope {
+                                            event_kind,
+                                            source_path: source_path.clone(),
+                                            destination_path: destination.clone(),
+                                            checksum: None,
+                                            method: method.as_str().to_string(),
+                                            status_code: status.as_u16(),
+                                            username: username.clone(),
+                                        });
+
+                                        p2p.announce(FileChangeEvent {
+                                            event_kind,
+                                            source_path,
+                                            destination_path: destination.clone(),
+                                            checksum: None,
+                                            size: 0,
+                                            username: username.clone(),
+                                        });
+                                    }
                                 }
                                 log_file_event(&event, &method, &uri, status, &user_agent);
 

@@ -5,7 +5,7 @@ use std::{
 };
 
 use hyper::{Method, StatusCode};
-use nacs_backend::db::EventKind;
+use nacs_backend::db::{Database, EventKind};
 use nacs_backend::sync::P2pHandle;
 use nacs_backend::webdav::{
     build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials,
@@ -266,9 +266,13 @@ fn unauthorized_options_response_includes_dav_capability_headers() {
 #[tokio::test]
 async fn spawn_p2p_announcement_computes_checksum_in_background() {
     let data_dir = temp_dir("spawn-p2p-announcement");
+    let sqlite_dir = temp_dir("spawn-p2p-announcement-sqlite");
     fs::create_dir_all(&data_dir).expect("temp dir should be created");
     fs::write(data_dir.join("report.txt"), b"hello webdav")
         .expect("test file should be written");
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
 
     let (p2p, mut rx) = P2pHandle::channel();
     let handle = spawn_p2p_announcement(
@@ -276,8 +280,11 @@ async fn spawn_p2p_announcement_computes_checksum_in_background() {
         "/report.txt".to_string(),
         None,
         "user".to_string(),
+        "PUT".to_string(),
+        201,
         data_dir.clone(),
         "/report.txt".to_string(),
+        database,
         p2p,
     );
 
@@ -291,12 +298,17 @@ async fn spawn_p2p_announcement_computes_checksum_in_background() {
     assert!(event.checksum.is_some());
 
     fs::remove_dir_all(&data_dir).expect("temp dir should be removed");
+    fs::remove_dir_all(&sqlite_dir).expect("temp dir should be removed");
 }
 
 #[tokio::test]
 async fn spawn_p2p_announcement_falls_back_when_file_is_missing() {
     let data_dir = temp_dir("spawn-p2p-announcement-missing");
+    let sqlite_dir = temp_dir("spawn-p2p-announcement-missing-sqlite");
     fs::create_dir_all(&data_dir).expect("temp dir should be created");
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
 
     let (p2p, mut rx) = P2pHandle::channel();
     let handle = spawn_p2p_announcement(
@@ -304,8 +316,11 @@ async fn spawn_p2p_announcement_falls_back_when_file_is_missing() {
         "/missing.txt".to_string(),
         None,
         "user".to_string(),
+        "DELETE".to_string(),
+        204,
         data_dir.clone(),
         "/missing.txt".to_string(),
+        database,
         p2p,
     );
 
@@ -317,4 +332,5 @@ async fn spawn_p2p_announcement_falls_back_when_file_is_missing() {
     assert_eq!(event.checksum, None);
 
     fs::remove_dir_all(&data_dir).expect("temp dir should be removed");
+    fs::remove_dir_all(&sqlite_dir).expect("temp dir should be removed");
 }
