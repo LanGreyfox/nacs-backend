@@ -7,7 +7,8 @@ use std::{
 use libp2p::PeerId;
 use nacs_backend::db::{Database, EventKind, Manifest, ManifestEntry, TombstoneEntry};
 use nacs_backend::sync::{
-    self, diff_manifests, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
+    self, diff_manifests, FileChangeEvent, FetchQueue, SyncAction, SyncRequest, SyncResponse,
+    SyncState,
 };
 use sha2::{Digest, Sha256};
 
@@ -388,6 +389,7 @@ async fn incoming_move_event_with_absolute_destination_url_renames_to_relative_t
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let event = FileChangeEvent {
         event_kind: EventKind::Moved,
@@ -398,11 +400,11 @@ async fn incoming_move_event_with_absolute_destination_url_renames_to_relative_t
         username: "peer:test".to_string(),
     };
 
-    let request = sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling move event should succeed");
 
-    assert!(request.is_none(), "local rename should not trigger a pull");
+    assert!(fetch_queue.is_empty().await, "local rename should not trigger a pull");
     assert!(
         !data_dir.join("old/file.txt").exists(),
         "source file should have been moved"
@@ -429,6 +431,7 @@ async fn incoming_copy_event_with_absolute_destination_url_copies_to_relative_ta
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let event = FileChangeEvent {
         event_kind: EventKind::Copied,
@@ -439,11 +442,11 @@ async fn incoming_copy_event_with_absolute_destination_url_copies_to_relative_ta
         username: "peer:test".to_string(),
     };
 
-    let request = sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling copy event should succeed");
 
-    assert!(request.is_none(), "local copy should not trigger a pull");
+    assert!(fetch_queue.is_empty().await, "local copy should not trigger a pull");
     assert_eq!(
         fs::read(data_dir.join("old/file.txt")).expect("source file should remain"),
         b"copy me"
@@ -471,6 +474,7 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let content = b"hello from a peer";
     let checksum = sha256_hex(content);
@@ -484,13 +488,13 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
         username: "peer:test".to_string(),
     };
 
-    let next_request = sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
-        .expect("handling the event should succeed")
-        .expect("a FetchFile request should be produced");
+        .expect("handling the event should succeed");
 
+    let initial_request = fetch_queue.pop().await.expect("an initial FetchFile request should be queued");
     assert!(matches!(
-        next_request,
+        initial_request,
         SyncRequest::FetchFile { ref path, offset: 0 } if path == "/incoming.txt"
     ));
 
@@ -506,7 +510,7 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(follow_up.is_none(), "single-chunk transfer should complete");
+    assert!(follow_up.is_empty(), "single-chunk transfer should complete");
     assert!(
         !state.is_pending(peer, "/incoming.txt"),
         "transfer should no longer be pending after completion"
@@ -531,6 +535,7 @@ async fn chunk_transfer_discarded_on_checksum_mismatch() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let content = b"tampered content";
 
@@ -543,7 +548,7 @@ async fn chunk_transfer_discarded_on_checksum_mismatch() {
         username: "peer:test".to_string(),
     };
 
-    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling the event should succeed");
 
@@ -559,7 +564,7 @@ async fn chunk_transfer_discarded_on_checksum_mismatch() {
         .await
         .expect("chunk handling should not error even on mismatch");
 
-    assert!(follow_up.is_none());
+    assert!(follow_up.is_empty());
     assert!(
         !data_dir.join("bad.txt").exists(),
         "file with mismatched checksum must not be materialized"
@@ -586,6 +591,7 @@ async fn not_found_response_removes_pending_temp_file() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -596,7 +602,7 @@ async fn not_found_response_removes_pending_temp_file() {
         username: "peer:test".to_string(),
     };
 
-    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling the event should succeed");
 
@@ -613,7 +619,7 @@ async fn not_found_response_removes_pending_temp_file() {
         .await
         .expect("not found should cancel cleanly");
 
-    assert!(follow_up.is_none());
+    assert!(follow_up.is_empty());
     assert!(
         !state.is_pending(peer, "/missing.txt"),
         "transfer should be removed from pending state"
@@ -639,6 +645,7 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let part_a = b"first-half-".to_vec();
     let part_b = b"second-half".to_vec();
@@ -655,7 +662,7 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
         username: "peer:test".to_string(),
     };
 
-    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling the event should succeed");
 
@@ -667,17 +674,29 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
         is_last: false,
     };
 
-    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, first_chunk)
+    let follow_ups = sync::handle_chunk_response(&mut state, &database, peer, first_chunk)
         .await
         .expect("chunk handling should succeed");
 
-    match follow_up {
-        Some(SyncRequest::FetchFile { path, offset }) => {
-            assert_eq!(path, "/multi.txt");
-            assert_eq!(offset, part_a.len() as u64);
-        }
-        other => panic!("expected a FetchFile follow-up request, got {other:?}"),
+    // The first follow-up re-issues offset 0 to probe the total size; the
+    // remaining window slots request the chunk grid for the known size.
+    assert!(matches!(
+        follow_ups.first(),
+        Some(SyncRequest::FetchFile { path, offset })
+            if path == "/multi.txt" && *offset == 0
+    ));
+    let chunk_size = sync::configured_chunk_size() as u64;
+    for (i, follow_up) in follow_ups.iter().skip(1).enumerate() {
+        assert!(matches!(
+            follow_up,
+            SyncRequest::FetchFile { path, offset }
+                if path == "/multi.txt" && *offset == (i as u64 + 1) * chunk_size
+        ));
     }
+    assert!(
+        !follow_ups.is_empty(),
+        "window refill should request the next chunks"
+    );
     assert!(
         state.is_pending(peer, "/multi.txt"),
         "transfer should still be pending after a non-final chunk"
@@ -695,7 +714,7 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(follow_up.is_none());
+    assert!(follow_up.is_empty());
     assert!(!state.is_pending(peer, "/multi.txt"));
 
     let written = fs::read(data_dir.join("multi.txt")).expect("file should have been written");
@@ -717,12 +736,13 @@ async fn read_chunk_handles_percent_encoded_path() {
     )
     .expect("test file should be created");
 
-    let response = sync::read_chunk(
-        &data_dir,
-        "/Traveller%202022%20Core%20Rulebook%20eBook.pdf",
-        0,
-    )
-    .await;
+    let response = sync::ChunkReader::new()
+        .read_chunk(
+            &data_dir,
+            "/Traveller%202022%20Core%20Rulebook%20eBook.pdf",
+            0,
+        )
+        .await;
 
     match response {
         SyncResponse::Chunk { data, is_last, .. } => {
@@ -747,6 +767,7 @@ async fn cancel_peer_removes_pending_transfer_and_temp_file() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let content = b"partial transfer content";
     let checksum = sha256_hex(content);
@@ -760,7 +781,7 @@ async fn cancel_peer_removes_pending_transfer_and_temp_file() {
         username: "peer:test".to_string(),
     };
 
-    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling the event should succeed");
 
@@ -776,7 +797,7 @@ async fn cancel_peer_removes_pending_transfer_and_temp_file() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(follow_up.is_some(), "transfer should still be pending after first chunk");
+    assert!(!follow_up.is_empty(), "transfer should still be pending after first chunk");
     assert!(state.is_pending(peer, "/disconnect.txt"));
     assert!(data_dir.join("disconnect.txt.p2p-tmp").exists());
 
@@ -807,6 +828,7 @@ async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
 
     let peer = PeerId::random();
     let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
 
     let first_part = b"first-half-".to_vec();
     let second_part = b"second-half".to_vec();
@@ -823,7 +845,7 @@ async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
         username: "peer:test".to_string(),
     };
 
-    sync::handle_incoming_event(&data_dir, &database, &mut state, peer, event)
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
         .await
         .expect("handling the event should succeed");
 
@@ -839,10 +861,10 @@ async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(matches!(
-        follow_up,
-        Some(SyncRequest::FetchFile { path, offset }) if path == "/multi-disconnect.txt" && offset == first_part.len() as u64
-    ));
+    assert!(follow_up.iter().any(|r| matches!(
+        r,
+        SyncRequest::FetchFile { path, .. } if path == "/multi-disconnect.txt"
+    )));
     assert!(state.is_pending(peer, "/multi-disconnect.txt"));
 
     state
@@ -868,10 +890,205 @@ async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
         .await
         .expect("late chunk should be ignored cleanly");
 
-    assert!(follow_up.is_none());
+    assert!(follow_up.is_empty());
     assert!(
         !data_dir.join("multi-disconnect.txt").exists(),
         "late chunks must not materialize a file after disconnect"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+// --- Pipelined window: out-of-order assembly and retry ---
+
+#[tokio::test]
+async fn out_of_order_chunks_are_reassembled_in_offset_order() {
+    let sqlite_dir = temp_dir("sync-ooo-sqlite");
+    let data_dir = temp_dir("sync-ooo-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
+
+    let part_a = b"chunk-zero-".to_vec();
+    let part_b = b"chunk-one-".to_vec();
+    let part_c = b"chunk-two".to_vec();
+    let mut full_content = part_a.clone();
+    full_content.extend_from_slice(&part_b);
+    full_content.extend_from_slice(&part_c);
+    let checksum = sha256_hex(&full_content);
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/ooo.txt".to_string(),
+        destination_path: None,
+        checksum: Some(checksum),
+        size: full_content.len() as u64,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
+        .await
+        .expect("handling the event should succeed");
+
+    // Deliver chunks out of order: last, then middle, then first.
+    let last_chunk = SyncResponse::Chunk {
+        path: "/ooo.txt".to_string(),
+        data: part_c.clone(),
+        offset: (part_a.len() + part_b.len()) as u64,
+        total_size: full_content.len() as u64,
+        is_last: true,
+    };
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, last_chunk)
+        .await
+        .expect("out-of-order last chunk should be buffered");
+    assert!(
+        state.is_pending(peer, "/ooo.txt"),
+        "transfer must stay pending while early chunks are missing"
+    );
+    assert!(follow_up.iter().all(|r| matches!(r, SyncRequest::FetchFile { .. })));
+
+    let middle_chunk = SyncResponse::Chunk {
+        path: "/ooo.txt".to_string(),
+        data: part_b.clone(),
+        offset: part_a.len() as u64,
+        total_size: full_content.len() as u64,
+        is_last: false,
+    };
+    sync::handle_chunk_response(&mut state, &database, peer, middle_chunk)
+        .await
+        .expect("out-of-order middle chunk should be buffered");
+    assert!(state.is_pending(peer, "/ooo.txt"));
+
+    let first_chunk = SyncResponse::Chunk {
+        path: "/ooo.txt".to_string(),
+        data: part_a.clone(),
+        offset: 0,
+        total_size: full_content.len() as u64,
+        is_last: false,
+    };
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, first_chunk)
+        .await
+        .expect("first chunk should complete the transfer");
+
+    assert!(follow_up.is_empty(), "transfer should complete once contiguous");
+    assert!(!state.is_pending(peer, "/ooo.txt"));
+
+    let written = fs::read(data_dir.join("ooo.txt")).expect("file should have been written");
+    assert_eq!(
+        written, full_content,
+        "out-of-order chunks must be reassembled in offset order (incremental hash verified)"
+    );
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn retry_chunk_recovers_from_failed_request() {
+    let sqlite_dir = temp_dir("sync-retry-sqlite");
+    let data_dir = temp_dir("sync-retry-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
+
+    let content = b"retry me";
+    let checksum = sha256_hex(content);
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/retry.txt".to_string(),
+        destination_path: None,
+        checksum: Some(checksum),
+        size: content.len() as u64,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
+        .await
+        .expect("handling the event should succeed");
+    assert!(state.is_pending(peer, "/retry.txt"));
+
+    // The initial fetch request (offset 0) fails; a retry must re-issue it.
+    let retry = state
+        .retry_chunk(peer, "/retry.txt", 0)
+        .await
+        .expect("failed chunk request should be re-queued");
+    assert!(matches!(
+        retry,
+        SyncRequest::FetchFile { ref path, offset: 0 } if path == "/retry.txt"
+    ));
+    assert!(state.is_pending(peer, "/retry.txt"));
+
+    let chunk_response = SyncResponse::Chunk {
+        path: "/retry.txt".to_string(),
+        data: content.to_vec(),
+        offset: 0,
+        total_size: content.len() as u64,
+        is_last: true,
+    };
+    let follow_up = sync::handle_chunk_response(&mut state, &database, peer, chunk_response)
+        .await
+        .expect("chunk handling should succeed");
+    assert!(follow_up.is_empty());
+
+    let written = fs::read(data_dir.join("retry.txt")).expect("file should have been written");
+    assert_eq!(written, content);
+
+    fs::remove_dir_all(&sqlite_dir).ok();
+    fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn cancel_transfer_removes_pending_state_and_temp_file() {
+    let sqlite_dir = temp_dir("sync-cancel-transfer-sqlite");
+    let data_dir = temp_dir("sync-cancel-transfer-data");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let database = Database::open(&sqlite_dir, &data_dir)
+        .await
+        .expect("database should open");
+
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+    let fetch_queue = FetchQueue::new();
+
+    let event = FileChangeEvent {
+        event_kind: EventKind::Created,
+        source_path: "/abort.txt".to_string(),
+        destination_path: None,
+        checksum: None,
+        size: 42,
+        username: "peer:test".to_string(),
+    };
+
+    sync::handle_incoming_event(&data_dir, &database, &mut state, &fetch_queue, peer, event)
+        .await
+        .expect("handling the event should succeed");
+    assert!(state.is_pending(peer, "/abort.txt"));
+    assert!(data_dir.join("abort.txt.p2p-tmp").exists());
+
+    state
+        .cancel_transfer(peer, "/abort.txt")
+        .await
+        .expect("cancel should succeed");
+
+    assert!(!state.is_pending(peer, "/abort.txt"));
+    assert!(
+        !data_dir.join("abort.txt.p2p-tmp").exists(),
+        "temp file should be removed when a transfer is aborted"
     );
 
     fs::remove_dir_all(&sqlite_dir).ok();

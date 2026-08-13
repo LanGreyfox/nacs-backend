@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     error::Error,
     io,
@@ -15,7 +15,7 @@ use libp2p::{
     mdns,
     noise,
     ping,
-    request_response,
+    request_response::{self, OutboundRequestId},
     swarm::{
         behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
         ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent,
@@ -38,6 +38,10 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
 const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
+// Generous per-request timeout: large chunks on slow links must not time out.
+const SYNC_REQUEST_TIMEOUT_SECS: u64 = 60;
+// How often a failed chunk request is retried before the transfer is aborted.
+const MAX_FETCH_RETRIES: u32 = 3;
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -188,7 +192,8 @@ pub async fn run_discovery(
                     StreamProtocol::new(SYNC_PROTOCOL),
                     request_response::ProtocolSupport::Full,
                 )],
-                request_response::Config::default(),
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(SYNC_REQUEST_TIMEOUT_SECS)),
             );
 
             Ok(DiscoveryBehaviour {
@@ -216,8 +221,24 @@ pub async fn run_discovery(
     let mut connected_peers = HashSet::new();
     let mut dialing_peers = HashSet::new();
     let mut sync_state = SyncState::new();
+    let fetch_queue = sync::FetchQueue::new();
+    let mut chunk_reader = sync::ChunkReader::new();
+    let mut pending_fetches: HashMap<OutboundRequestId, (PeerId, String, u64, u32)> = HashMap::new();
     loop {
         tokio::select! {
+            // Priority: queued fetch requests are sent before new swarm events
+            // are processed, so the request window refills promptly.
+            biased;
+            Some(request) = fetch_queue.pop() => {
+                if let SyncRequest::FetchFile { path, offset } = &request {
+                    let path = path.clone();
+                    let offset = *offset;
+                    if let Some(peer) = connected_peers.iter().next().copied() {
+                        let id = swarm.behaviour_mut().sync.send_request(&peer, request);
+                        pending_fetches.insert(id, (peer, path, offset, 0));
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -291,17 +312,13 @@ pub async fn run_discovery(
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                             }
                             SyncRequest::FetchFile { path, offset } => {
-                                let response = sync::read_chunk(&data_dir, &path, offset).await;
+                                let response = chunk_reader.read_chunk(&data_dir, &path, offset).await;
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                             }
                             SyncRequest::Event(event) => {
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Ack);
-                                match sync::handle_incoming_event(&data_dir, &database, &mut sync_state, peer, event).await {
-                                    Ok(Some(request)) => {
-                                        swarm.behaviour_mut().sync.send_request(&peer, request);
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => eprintln!("failed to apply incoming p2p event from {peer}: {err}"),
+                                if let Err(err) = sync::handle_incoming_event(&data_dir, &database, &mut sync_state, &fetch_queue, peer, event).await {
+                                    eprintln!("failed to apply incoming p2p event from {peer}: {err}");
                                 }
                             }
                         },
@@ -309,31 +326,80 @@ pub async fn run_discovery(
                             SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
                                 Ok(local_manifest) => {
                                     let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
-                                    let requests = sync::apply_manifest_actions(
+                                    sync::apply_manifest_actions(
                                         &data_dir,
                                         &database,
                                         &mut sync_state,
+                                        &fetch_queue,
                                         peer,
                                         actions,
                                     )
                                     .await;
-                                    for request in requests {
-                                        swarm.behaviour_mut().sync.send_request(&peer, request);
-                                    }
                                 }
                                 Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
                             },
                             other => {
                                 match sync::handle_chunk_response(&mut sync_state, &database, peer, other).await {
-                                    Ok(Some(request)) => {
-                                        swarm.behaviour_mut().sync.send_request(&peer, request);
+                                    Ok(requests) => {
+                                        for request in requests {
+                                            if let SyncRequest::FetchFile { path, offset } = &request {
+                                                let path = path.clone();
+                                                let offset = *offset;
+                                                let id = swarm.behaviour_mut().sync.send_request(&peer, request);
+                                                pending_fetches.insert(id, (peer, path, offset, 0));
+                                            }
+                                        }
                                     }
-                                    Ok(None) => {}
                                     Err(err) => eprintln!("failed to process chunk response from {peer}: {err}"),
                                 }
                             }
                         },
                     },
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    })) => {
+                        let Some((fetch_peer, path, offset, attempts)) = pending_fetches.remove(&request_id) else {
+                            eprintln!("sync request to {peer} failed (untracked): {error}");
+                            continue;
+                        };
+                        if !sync_state.is_pending(fetch_peer, &path) {
+                            continue;
+                        }
+                        if attempts + 1 >= MAX_FETCH_RETRIES {
+                            eprintln!(
+                                "sync: giving up on {path} from {fetch_peer} after {MAX_FETCH_RETRIES} failed attempts: {error}"
+                            );
+                            if let Err(err) = sync_state.cancel_transfer(fetch_peer, &path).await {
+                                eprintln!("failed to cancel transfer for {path}: {err}");
+                            }
+                            continue;
+                        }
+                        eprintln!(
+                            "sync: chunk request for {path} from {fetch_peer} failed ({error}); retrying (attempt {})",
+                            attempts + 2
+                        );
+                        match sync_state.retry_chunk(fetch_peer, &path, offset).await {
+                            Some(request) => {
+                                let id = swarm.behaviour_mut().sync.send_request(&fetch_peer, request);
+                                pending_fetches.insert(id, (fetch_peer, path, offset, attempts + 1));
+                            }
+                            None => {
+                                // All chunks already requested; a reply may
+                                // still arrive, so keep the transfer pending.
+                            }
+                        }
+                    },
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::InboundFailure {
+                        peer,
+                        error,
+                        ..
+                    })) => {
+                        eprintln!("inbound sync request from {peer} failed: {error}");
+                    }
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::ResponseSent { .. })) => {},
                     SwarmEvent::ConnectionClosed {
                         peer_id,
                         cause,

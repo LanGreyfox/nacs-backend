@@ -12,25 +12,37 @@
 //! bounded to one chunk regardless of file size.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     io,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use libp2p::PeerId;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc,
+    io::{AsyncSeekExt, AsyncWriteExt},
+    sync::{mpsc, Mutex},
 };
 
 use crate::db::{self, Database, EventEnvelope, EventKind};
 
 /// Maximum number of bytes transferred per chunk request/response round trip.
-pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+///
+/// Note: the libp2p CBOR codec limits responses to 10 MiB by default, so
+/// values above ~10 MiB require raising the codec's response size limit via
+/// `Behaviour::with_codec(... .set_response_size_maximum(...))`.
+pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const SYNC_CHUNK_SIZE_ENV: &str = "SYNC_CHUNK_SIZE_BYTES";
+
+/// Number of chunk requests kept in flight per in-progress transfer.
+pub const DEFAULT_WINDOW_REQUESTS: usize = 4;
+const SYNC_WINDOW_REQUESTS_ENV: &str = "SYNC_WINDOW_REQUESTS";
+
+/// Number of file handles cached on the sending side to avoid re-opening the
+/// same file for every chunk request.
+const CHUNK_READER_CACHE_CAPACITY: usize = 8;
 
 /// Returns the configured per-chunk transfer size in bytes.
 ///
@@ -46,6 +58,51 @@ pub fn configured_chunk_size() -> usize {
         );
         chunk_size
     })
+}
+
+/// Returns the configured number of in-flight chunk requests per transfer.
+///
+/// Resolved once from `SYNC_WINDOW_REQUESTS` and cached for the process
+/// lifetime. The memory bound per transfer is roughly
+/// window x chunk size (see [`configured_chunk_size`]).
+pub fn configured_window_requests() -> usize {
+    static WINDOW_REQUESTS: OnceLock<usize> = OnceLock::new();
+
+    *WINDOW_REQUESTS.get_or_init(|| {
+        let window = resolve_window_requests_from_env(env::var(SYNC_WINDOW_REQUESTS_ENV));
+        println!(
+            "sync: configured window = {window} in-flight requests ({SYNC_WINDOW_REQUESTS_ENV})"
+        );
+        window
+    })
+}
+
+#[doc(hidden)]
+pub fn resolve_window_requests_from_env(raw: Result<String, env::VarError>) -> usize {
+    match raw {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(0) => {
+                eprintln!(
+                    "sync: {SYNC_WINDOW_REQUESTS_ENV}=0 is invalid; using default {DEFAULT_WINDOW_REQUESTS}"
+                );
+                DEFAULT_WINDOW_REQUESTS
+            }
+            Ok(size) => size,
+            Err(_) => {
+                eprintln!(
+                    "sync: invalid {SYNC_WINDOW_REQUESTS_ENV} value '{value}'; using default {DEFAULT_WINDOW_REQUESTS}"
+                );
+                DEFAULT_WINDOW_REQUESTS
+            }
+        },
+        Err(env::VarError::NotPresent) => DEFAULT_WINDOW_REQUESTS,
+        Err(err) => {
+            eprintln!(
+                "sync: unable to read {SYNC_WINDOW_REQUESTS_ENV} ({err}); using default {DEFAULT_WINDOW_REQUESTS}"
+            );
+            DEFAULT_WINDOW_REQUESTS
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -148,6 +205,41 @@ pub enum SyncAction {
     CreateDir { path: String },
     /// Delete a locally-present path; the peer's tombstone is newer.
     Delete { path: String },
+}
+
+/// Queued initial fetch requests for a transfer that has just been started.
+/// The pull-side handlers (`start_pull`, `handle_incoming_event`,
+/// `apply_manifest_actions`) cannot push requests themselves, so the requests
+/// are collected here and drained by the caller in `p2p.rs`, which sends them
+/// to the peer (one per iteration of the swarm loop).
+pub struct FetchQueue {
+    inner: Arc<Mutex<Vec<SyncRequest>>>,
+}
+
+impl FetchQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub async fn push(&self, request: SyncRequest) {
+        self.inner.lock().await.push(request);
+    }
+
+    pub async fn pop(&self) -> Option<SyncRequest> {
+        self.inner.lock().await.pop()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
+}
+
+impl Default for FetchQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +403,11 @@ pub fn diff_manifests(local: &db::Manifest, remote: &db::Manifest) -> Vec<SyncAc
 }
 
 /// State for a single in-flight chunked file download from a peer.
+///
+/// Up to [`configured_window_requests`] chunk requests are kept in flight at
+/// the same time. Responses may arrive out of order (separate substreams), so
+/// chunks are staged in `buffered` and only written to disk in offset order,
+/// which also lets us hash incrementally while writing.
 struct PendingTransfer {
     tmp_path: PathBuf,
     final_path: PathBuf,
@@ -320,6 +417,18 @@ struct PendingTransfer {
     event_kind: EventKind,
     destination_path: Option<String>,
     username: String,
+    /// Total file size, learned from the first chunk response.
+    total_size: Option<u64>,
+    /// Offset up to which fetch requests have been issued.
+    next_request_offset: u64,
+    /// Number of chunk requests currently awaiting a response.
+    in_flight: usize,
+    /// Next offset to write to disk.
+    write_offset: u64,
+    /// Chunks that arrived ahead of their position, keyed by offset.
+    buffered: BTreeMap<u64, Vec<u8>>,
+    /// Rolling checksum over the bytes written so far.
+    hasher: Sha256,
 }
 
 /// Tracks in-flight chunked downloads, keyed by (peer, path), so multiple
@@ -355,6 +464,46 @@ impl SyncState {
         Ok(())
     }
 
+    /// Aborts the transfer for `(peer, path)` and removes its temp file.
+    /// Used by the caller when an outbound chunk request fails permanently.
+    pub async fn cancel_transfer(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
+        self.cancel(peer, path).await
+    }
+
+    /// Re-queues a failed chunk request: drops one in-flight slot and, unless
+    /// the byte is already covered by another in-flight or buffered chunk,
+    /// re-requests the failed offset. Returns the follow-up request, if any.
+    pub async fn retry_chunk(
+        &mut self,
+        peer: PeerId,
+        path: &str,
+        failed_offset: u64,
+    ) -> Option<SyncRequest> {
+        let transfer = self.pending.get_mut(&(peer, path.to_string()))?;
+
+        transfer.in_flight = transfer.in_flight.saturating_sub(1);
+
+        let chunk_size = configured_chunk_size() as u64;
+        let already_buffered = transfer
+            .buffered
+            .range(failed_offset..failed_offset.saturating_add(chunk_size))
+            .next()
+            .is_some();
+        let already_written = failed_offset < transfer.write_offset;
+        let already_requested = failed_offset < transfer.next_request_offset
+            && !already_written
+            && !already_buffered;
+        if already_written || already_buffered || already_requested {
+            // Another request/reply already covers this range; nothing to do.
+            return None;
+        }
+
+        Some(SyncRequest::FetchFile {
+            path: path.to_string(),
+            offset: failed_offset,
+        })
+    }
+
     async fn cancel(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
         if let Some(transfer) = self.pending.remove(&(peer, path.to_string())) {
             drop(transfer.file);
@@ -366,10 +515,12 @@ impl SyncState {
 
     /// Begins a chunked pull of `resource_path` (written to `destination_path`
     /// if given, otherwise to `resource_path` itself) from `peer`. No-op if a
-    /// pull for the same (peer, path) is already in flight.
+    /// pull for the same (peer, path) is already in flight. The first fetch
+    /// request is queued on `fetch_queue` for the caller to send.
     async fn start_pull(
         &mut self,
         data_dir: &Path,
+        fetch_queue: &FetchQueue,
         peer: PeerId,
         resource_path: String,
         expected_checksum: Option<String>,
@@ -406,20 +557,35 @@ impl SyncState {
             PendingTransfer {
                 tmp_path,
                 final_path,
-                resource_path,
+                resource_path: resource_path.clone(),
                 file,
                 expected_checksum,
                 event_kind,
                 destination_path,
                 username,
+                total_size: None,
+                next_request_offset: 0,
+                in_flight: 0,
+                write_offset: 0,
+                buffered: BTreeMap::new(),
+                hasher: Sha256::new(),
             },
         );
+
+        fetch_queue
+            .push(SyncRequest::FetchFile {
+                path: resource_path,
+                offset: 0,
+            })
+            .await;
         Ok(())
     }
 
     /// Feeds one received chunk into the matching in-flight transfer.
-    /// Returns a follow-up `FetchFile` request if more chunks are needed, or
-    /// `None` once the transfer is complete (or was unexpected and ignored).
+    /// Chunks are staged until they can be written in offset order; the
+    /// checksum is updated incrementally while writing. Returns follow-up
+    /// `FetchFile` requests to keep the request window full, or an empty vec
+    /// once the transfer is complete (or was unexpected and ignored).
     async fn on_chunk(
         &mut self,
         database: &Database,
@@ -427,22 +593,35 @@ impl SyncState {
         path: String,
         data: Vec<u8>,
         offset: u64,
-        is_last: bool,
-    ) -> io::Result<Option<SyncRequest>> {
+        total_size: u64,
+    ) -> io::Result<Vec<SyncRequest>> {
         let key = (peer, path.clone());
         let transfer = match self.pending.get_mut(&key) {
             Some(t) => t,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         };
 
-        transfer.file.write_all(&data).await?;
+        transfer.total_size = Some(total_size);
+        transfer.in_flight = transfer.in_flight.saturating_sub(1);
 
-        if !is_last {
-            let next_offset = offset + data.len() as u64;
-            return Ok(Some(SyncRequest::FetchFile {
-                path,
-                offset: next_offset,
-            }));
+        if data.is_empty() {
+            // Chunks we already passed (e.g. a retried request racing the
+            // original response) carry no new data; just refill the window.
+            return Ok(refill_window(transfer, &path, configured_window_requests()));
+        }
+
+        transfer.buffered.entry(offset).or_insert(data);
+
+        // Write everything that is contiguous from write_offset onwards and
+        // update the rolling checksum in the same pass.
+        while let Some(chunk) = transfer.buffered.remove(&transfer.write_offset) {
+            transfer.file.write_all(&chunk).await?;
+            transfer.hasher.update(&chunk);
+            transfer.write_offset += chunk.len() as u64;
+        }
+
+        if transfer.write_offset < total_size {
+            return Ok(refill_window(transfer, &path, configured_window_requests()));
         }
 
         let mut transfer = self.pending.remove(&key).expect("checked above");
@@ -450,7 +629,7 @@ impl SyncState {
         drop(transfer.file);
 
         println!("sync: verify checksum for {}", transfer.resource_path);
-        let actual_checksum = checksum_file(&transfer.tmp_path).await?;
+        let actual_checksum = format!("{:x}", transfer.hasher.finalize());
         if let Some(expected) = &transfer.expected_checksum {
             if expected != &actual_checksum {
                 eprintln!(
@@ -459,7 +638,7 @@ impl SyncState {
                 );
                 println!("sync: remove temp file {}", transfer.tmp_path.display());
                 let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
-                return Ok(None);
+                return Ok(Vec::new());
             }
         }
 
@@ -480,22 +659,32 @@ impl SyncState {
             username: transfer.username,
         });
 
-        Ok(None)
+        Ok(Vec::new())
     }
 }
 
-async fn checksum_file(path: &Path) -> io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
+/// Issues new fetch requests until the window is full or the whole file has
+/// been requested. Beyond the first (size-probing) request, offsets are only
+/// issued once the total size is known, so we never ask for ranges past the
+/// end of the file.
+fn refill_window(transfer: &mut PendingTransfer, path: &str, window: usize) -> Vec<SyncRequest> {
+    let mut requests = Vec::new();
+    while transfer.in_flight < window {
+        let Some(total) = transfer.total_size else {
+            break;
+        };
+        let offset = transfer.next_request_offset;
+        if offset >= total {
             break;
         }
-        hasher.update(&buffer[..read]);
+        requests.push(SyncRequest::FetchFile {
+            path: path.to_string(),
+            offset,
+        });
+        transfer.in_flight += 1;
+        transfer.next_request_offset = offset + configured_chunk_size() as u64;
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    requests
 }
 
 async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
@@ -509,79 +698,134 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
     }
 }
 
-/// Reads one chunk of `path` at `offset` from `data_dir`, for responding to
-/// an inbound [`SyncRequest::FetchFile`]. Never fails: I/O errors are logged
-/// and reported to the peer as [`SyncResponse::NotFound`] so the request
-/// always gets a response.
-pub async fn read_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
-    let fs_path = fs_path_from_wire_path(data_dir, path);
-    let metadata = match tokio::fs::metadata(&fs_path).await {
-        Ok(m) => m,
-        Err(err) => {
-            if err.kind() != io::ErrorKind::NotFound {
-                eprintln!("sync: failed to stat {path} for chunk request: {err}");
+/// Sender-side chunk reader with a small LRU cache of open file handles, so
+/// pipelined chunk requests against the same file don't each pay for an
+/// open()+seek() pair.
+pub struct ChunkReader {
+    handles: Vec<(String, tokio::fs::File)>,
+}
+
+impl ChunkReader {
+    pub fn new() -> Self {
+        Self { handles: Vec::new() }
+    }
+
+    /// Reads one chunk of `path` at `offset` from `data_dir`. Never fails:
+    /// I/O errors are logged and reported as [`SyncResponse::NotFound`] so the
+    /// request always gets a response.
+    pub async fn read_chunk(&mut self, data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
+        let fs_path = fs_path_from_wire_path(data_dir, path);
+        let metadata = match tokio::fs::metadata(&fs_path).await {
+            Ok(m) => m,
+            Err(err) => {
+                if err.kind() != io::ErrorKind::NotFound {
+                    eprintln!("sync: failed to stat {path} for chunk request: {err}");
+                }
+                return SyncResponse::NotFound {
+                    path: path.to_string(),
+                };
             }
+        };
+        let total_size = metadata.len();
+        let chunk_size = configured_chunk_size();
+
+        if offset >= total_size && total_size > 0 {
             return SyncResponse::NotFound {
                 path: path.to_string(),
             };
         }
-    };
-    let total_size = metadata.len();
-    let chunk_size = configured_chunk_size();
 
-    let read_result: io::Result<Vec<u8>> = async {
-        let mut file = tokio::fs::File::open(&fs_path).await?;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let remaining = total_size.saturating_sub(offset);
-        let to_read = remaining.min(chunk_size as u64) as usize;
-        let mut buffer = vec![0_u8; to_read];
-        file.read_exact(&mut buffer).await?;
-        Ok(buffer)
+        let file = match self.get_handle(path, &fs_path).await {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("sync: failed to open {path} for chunk request: {err}");
+                return SyncResponse::NotFound {
+                    path: path.to_string(),
+                };
+            }
+        };
+
+        let read_result: io::Result<Vec<u8>> = async {
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let remaining = total_size.saturating_sub(offset);
+            let to_read = remaining.min(chunk_size as u64) as usize;
+            let mut buffer = vec![0_u8; to_read];
+            tokio::io::AsyncReadExt::read_exact(file, &mut buffer).await?;
+            Ok(buffer)
+        }
+        .await;
+
+        match read_result {
+            Ok(buffer) => {
+                let new_offset = offset + buffer.len() as u64;
+                SyncResponse::Chunk {
+                    path: path.to_string(),
+                    data: buffer,
+                    offset,
+                    total_size,
+                    is_last: new_offset >= total_size,
+                }
+            }
+            Err(err) => {
+                eprintln!("sync: failed to read chunk of {path} at offset {offset}: {err}");
+                // Drop the (possibly broken) cached handle so the next request
+                // re-opens the file.
+                self.handles.retain(|(cached, _)| cached != path);
+                SyncResponse::NotFound {
+                    path: path.to_string(),
+                }
+            }
+        }
     }
-    .await;
 
-    match read_result {
-        Ok(buffer) => {
-            let new_offset = offset + buffer.len() as u64;
-            SyncResponse::Chunk {
-                path: path.to_string(),
-                data: buffer,
-                offset,
-                total_size,
-                is_last: new_offset >= total_size,
+    async fn get_handle(&mut self, path: &str, fs_path: &Path) -> io::Result<&mut tokio::fs::File> {
+        if let Some(pos) = self.handles.iter().position(|(cached, _)| cached == path) {
+            let entry = self.handles.remove(pos);
+            self.handles.push(entry);
+        } else {
+            let file = tokio::fs::File::open(fs_path).await?;
+            self.handles.push((path.to_string(), file));
+            if self.handles.len() > CHUNK_READER_CACHE_CAPACITY {
+                self.handles.remove(0);
             }
         }
-        Err(err) => {
-            eprintln!("sync: failed to read chunk of {path} at offset {offset}: {err}");
-            SyncResponse::NotFound {
-                path: path.to_string(),
-            }
-        }
+        let (_, file) = self.handles.last_mut().expect("just inserted or moved");
+        Ok(file)
+    }
+}
+
+impl Default for ChunkReader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Applies an inbound `Response::Chunk`/`Response::NotFound` to the matching
-/// pending transfer. Returns a follow-up request to send, if any.
+/// pending transfer. Returns follow-up requests to send, if any.
 pub async fn handle_chunk_response(
     state: &mut SyncState,
     database: &Database,
     peer: PeerId,
     response: SyncResponse,
-) -> io::Result<Option<SyncRequest>> {
+) -> io::Result<Vec<SyncRequest>> {
     match response {
         SyncResponse::Chunk {
             path,
             data,
             offset,
-            is_last,
+            total_size,
             ..
-        } => state.on_chunk(database, peer, path, data, offset, is_last).await,
+        } => {
+            state
+                .on_chunk(database, peer, path, data, offset, total_size)
+                .await
+        }
         SyncResponse::NotFound { path } => {
             println!("sync: peer {peer} no longer has {path}; dropping pending transfer");
             state.cancel(peer, &path).await?;
-            Ok(None)
+            Ok(Vec::new())
         }
-        SyncResponse::Manifest(_) | SyncResponse::Ack => Ok(None),
+        SyncResponse::Manifest(_) | SyncResponse::Ack => Ok(Vec::new()),
     }
 }
 
@@ -594,9 +838,10 @@ pub async fn handle_incoming_event(
     data_dir: &Path,
     database: &Database,
     state: &mut SyncState,
+    fetch_queue: &FetchQueue,
     peer: PeerId,
     event: FileChangeEvent,
-) -> io::Result<Option<SyncRequest>> {
+) -> io::Result<()> {
     let source_path = normalize_wire_path(&event.source_path);
     let destination_path = event
         .destination_path
@@ -616,7 +861,7 @@ pub async fn handle_incoming_event(
                 status_code: 200,
                 username: event.username,
             });
-            Ok(None)
+            Ok(())
         }
         EventKind::DirCreated => {
             let dir_path = fs_path_from_wire_path(data_dir, &source_path);
@@ -631,7 +876,7 @@ pub async fn handle_incoming_event(
                 status_code: 200,
                 username: event.username,
             });
-            Ok(None)
+            Ok(())
         }
         EventKind::Renamed | EventKind::Moved => {
             let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
@@ -654,14 +899,15 @@ pub async fn handle_incoming_event(
                     status_code: 200,
                     username: event.username,
                 });
-                Ok(None)
+                Ok(())
             } else if state.is_pending(peer, &dest) {
-                Ok(None)
+                Ok(())
             } else {
                 println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
                 state
                     .start_pull(
                         data_dir,
+                        fetch_queue,
                         peer,
                         dest.clone(),
                         event.checksum,
@@ -670,7 +916,7 @@ pub async fn handle_incoming_event(
                         event.username,
                     )
                     .await?;
-                Ok(Some(SyncRequest::FetchFile { path: dest, offset: 0 }))
+                Ok(())
             }
         }
         EventKind::Copied => {
@@ -694,14 +940,15 @@ pub async fn handle_incoming_event(
                     status_code: 200,
                     username: event.username,
                 });
-                Ok(None)
+                Ok(())
             } else if state.is_pending(peer, &dest) {
-                Ok(None)
+                Ok(())
             } else {
                 println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
                 state
                     .start_pull(
                         data_dir,
+                        fetch_queue,
                         peer,
                         dest.clone(),
                         event.checksum,
@@ -710,18 +957,19 @@ pub async fn handle_incoming_event(
                         event.username,
                     )
                     .await?;
-                Ok(Some(SyncRequest::FetchFile { path: dest, offset: 0 }))
+                Ok(())
             }
         }
         EventKind::Created | EventKind::Edited => {
             let path = source_path;
             if state.is_pending(peer, &path) {
-                Ok(None)
+                Ok(())
             } else {
                 println!("sync: start pull for incoming {}", path);
                 state
                     .start_pull(
                         data_dir,
+                        fetch_queue,
                         peer,
                         path.clone(),
                         event.checksum,
@@ -730,7 +978,7 @@ pub async fn handle_incoming_event(
                         event.username,
                     )
                     .await?;
-                Ok(Some(SyncRequest::FetchFile { path, offset: 0 }))
+                Ok(())
             }
         }
     }
@@ -738,16 +986,17 @@ pub async fn handle_incoming_event(
 
 /// Applies the actions computed by [`diff_manifests`] against local state:
 /// directory creation and deletion happen immediately, while file pulls are
-/// started via [`SyncState`] and returned as requests for the caller to send.
+/// started via [`SyncState`] and their initial fetch requests are queued on
+/// `fetch_queue` for the caller to send.
 pub async fn apply_manifest_actions(
     data_dir: &Path,
     database: &Database,
     state: &mut SyncState,
+    fetch_queue: &FetchQueue,
     peer: PeerId,
     actions: Vec<SyncAction>,
-) -> Vec<SyncRequest> {
+) {
     let username = format!("p2p:{peer}");
-    let mut requests = Vec::new();
 
     for action in actions {
         match action {
@@ -792,6 +1041,7 @@ pub async fn apply_manifest_actions(
                 if let Err(err) = state
                     .start_pull(
                         data_dir,
+                        fetch_queue,
                         peer,
                         path.clone(),
                         checksum,
@@ -804,11 +1054,8 @@ pub async fn apply_manifest_actions(
                     eprintln!("sync: failed to start pull for {path}: {err}");
                     continue;
                 }
-                requests.push(SyncRequest::FetchFile { path, offset: 0 });
             }
         }
     }
-
-    requests
 }
 

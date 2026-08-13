@@ -58,8 +58,9 @@
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
-✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1
-✅ P2P Sync Chunking: default 2 MiB pull-based file transfers with checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES
+✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1 (wire format unchanged and backwards compatible)
+✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES (note: the libp2p CBOR codec limits responses to 10 MiB by default; larger chunks need a custom codec limit)
+✅ P2P Sync Pipelining: up to SYNC_WINDOW_REQUESTS chunk requests in flight per transfer (default 4); out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
@@ -138,7 +139,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
-- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 2097152 bytes (2 MiB); invalid values warn and fall back to default
+- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 4194304 bytes (4 MiB); invalid values warn and fall back to default
+- **Request window:** Configurable via `SYNC_WINDOW_REQUESTS`, defaults to 4 in-flight chunk requests per transfer; invalid values warn and fall back to default
+- **Request timeout:** 60 s per sync request; failed chunk requests are retried up to 3 times before the transfer is aborted
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
 - **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
@@ -157,7 +160,8 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | **Sync tests** | `cargo test --test sync_tests` |
 | **All tests** | `cargo test --all` |
 | **Set P2P Port** | `P2P_PORT=5001 cargo run` |
-| **Set sync chunk size** | `SYNC_CHUNK_SIZE_BYTES=4194304 cargo run` |
+| **Set sync chunk size** | `SYNC_CHUNK_SIZE_BYTES=8388608 cargo run` |
+| **Set sync window** | `SYNC_WINDOW_REQUESTS=8 cargo run` |
 
 ---
 
@@ -173,7 +177,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-08-10 (sync chunk size configuration and current P2P documentation update) |
+| **Last Updated** | 2026-08-13 (sync pipelining: sliding-window chunk requests, incremental checksums, sender-side file handle cache, retry/timeout hardening) |
 | **Status** | ✅ Active project info for future interactions |
 | **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
 
