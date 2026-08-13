@@ -431,6 +431,8 @@ struct PendingTransfer {
     buffered: BTreeMap<u64, Vec<u8>>,
     /// Rolling checksum over the bytes written so far.
     hasher: Sha256,
+    /// When this transfer was started, for stale-transfer detection.
+    started_at: std::time::Instant,
 }
 
 /// Tracks in-flight chunked downloads, keyed by (peer, path), so multiple
@@ -472,8 +474,7 @@ impl SyncState {
         self.cancel(peer, path).await
     }
 
-    /// Re-queues a failed chunk request: drops one in-flight slot and, unless
-    /// the byte is already covered by another in-flight or buffered chunk,
+    /// Re-queues a failed chunk request: drops one in-flight slot and
     /// re-requests the failed offset. Returns the follow-up request, if any.
     pub async fn retry_chunk(
         &mut self,
@@ -492,18 +493,44 @@ impl SyncState {
             .next()
             .is_some();
         let already_written = failed_offset < transfer.write_offset;
-        let already_requested = failed_offset < transfer.next_request_offset
-            && !already_written
-            && !already_buffered;
-        if already_written || already_buffered || already_requested {
-            // Another request/reply already covers this range; nothing to do.
+        if already_written || already_buffered {
+            // Another reply already covers this range; nothing to do.
             return None;
         }
 
+        // If the failed offset is beyond what we've requested so far, that
+        // means it was part of the window and we should re-request it.
+        // Otherwise, if everything was already requested, restart from the
+        // current write position to recover from a stalled transfer.
+        let retry_offset = if failed_offset < transfer.next_request_offset {
+            failed_offset
+        } else {
+            transfer.write_offset
+        };
+
         Some(SyncRequest::FetchFile {
             path: path.to_string(),
-            offset: failed_offset,
+            offset: retry_offset,
         })
+    }
+
+    /// Removes transfers that have been pending longer than `max_age` without
+    /// completing. Returns the number of removed transfers.
+    pub async fn cleanup_stale_transfers(&mut self, max_age: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<(PeerId, String)> = self
+            .pending
+            .iter()
+            .filter(|(_, transfer)| now.duration_since(transfer.started_at) > max_age)
+            .map(|((peer, path), _)| (*peer, path.clone()))
+            .collect();
+
+        let count = stale.len();
+        for (peer, path) in stale {
+            eprintln!("sync: removing stale transfer for {path} from {peer} (pending > {max_age:?})");
+            let _ = self.cancel(peer, &path).await;
+        }
+        count
     }
 
     async fn cancel(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
@@ -572,6 +599,7 @@ impl SyncState {
                 last_log_offset: 0,
                 buffered: BTreeMap::new(),
                 hasher: Sha256::new(),
+                started_at: std::time::Instant::now(),
             },
         );
 

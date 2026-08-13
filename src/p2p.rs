@@ -10,7 +10,7 @@ use std::{
 
 use libp2p::{
     core::{transport::PortUse, upgrade::DeniedUpgrade, Endpoint, Multiaddr},
-    futures::{FutureExt, StreamExt},
+    futures::StreamExt,
     identity,
     mdns,
     noise,
@@ -224,6 +224,8 @@ pub async fn run_discovery(
     let fetch_queue = sync::FetchQueue::new();
     let mut chunk_reader = sync::ChunkReader::new();
     let mut pending_fetches: HashMap<OutboundRequestId, (PeerId, String, u64, u32)> = HashMap::new();
+    let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         // Drain all queued fetch requests before waiting for new swarm events.
         while let Some(request) = fetch_queue.pop().await {
@@ -243,8 +245,17 @@ pub async fn run_discovery(
             }
         }
 
-        let event = swarm.select_next_some().await;
-        match event {
+        tokio::select! {
+            _ = cleanup_interval.tick() => {
+                let removed = sync_state
+                    .cleanup_stale_transfers(Duration::from_secs(120))
+                    .await;
+                if removed > 0 {
+                    eprintln!("sync: cleaned up {removed} stale transfer(s)");
+                }
+            }
+            event = swarm.select_next_some() => {
+                match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("p2p listening on {address}");
                     }
@@ -460,14 +471,14 @@ pub async fn run_discovery(
                     },
                     _ => {}
                 }
-
-        // Broadcast locally-originated change events to all connected peers.
-        if let Some(change_event) = announce_rx.recv().now_or_never().flatten() {
-            for peer in connected_peers.iter() {
-                swarm
-                    .behaviour_mut()
-                    .sync
-                    .send_request(peer, SyncRequest::Event(change_event.clone()));
+            }
+            Some(change_event) = announce_rx.recv() => {
+                for peer in connected_peers.iter() {
+                    swarm
+                        .behaviour_mut()
+                        .sync
+                        .send_request(peer, SyncRequest::Event(change_event.clone()));
+                }
             }
         }
     }
