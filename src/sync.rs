@@ -431,8 +431,9 @@ struct PendingTransfer {
     buffered: BTreeMap<u64, Vec<u8>>,
     /// Rolling checksum over the bytes written so far.
     hasher: Sha256,
-    /// When this transfer was started, for stale-transfer detection.
-    started_at: std::time::Instant,
+    /// When the last chunk was received or a request was sent, for
+    /// stalled-transfer detection.
+    last_activity: std::time::Instant,
 }
 
 /// Tracks in-flight chunked downloads, keyed by (peer, path), so multiple
@@ -485,6 +486,7 @@ impl SyncState {
         let transfer = self.pending.get_mut(&(peer, path.to_string()))?;
 
         transfer.in_flight = transfer.in_flight.saturating_sub(1);
+        transfer.last_activity = std::time::Instant::now();
 
         let chunk_size = configured_chunk_size() as u64;
         let already_buffered = transfer
@@ -498,36 +500,78 @@ impl SyncState {
             return None;
         }
 
-        // If the failed offset is beyond what we've requested so far, that
-        // means it was part of the window and we should re-request it.
-        // Otherwise, if everything was already requested, restart from the
-        // current write position to recover from a stalled transfer.
-        let retry_offset = if failed_offset < transfer.next_request_offset {
-            failed_offset
-        } else {
-            transfer.write_offset
-        };
-
+        // Re-request the failed offset. If the transfer is stalled (all
+        // requested but nothing arriving), the caller can detect this via
+        // `is_stalled` and restart from `write_offset`.
         Some(SyncRequest::FetchFile {
             path: path.to_string(),
-            offset: retry_offset,
+            offset: failed_offset,
         })
     }
 
+    /// Returns true if the transfer has made no progress for longer than
+    /// `threshold` and all requested chunks are in flight.
+    pub fn is_stalled(&self, peer: PeerId, path: &str, threshold: std::time::Duration) -> bool {
+        let Some(transfer) = self.pending.get(&(peer, path.to_string())) else {
+            return false;
+        };
+        if transfer.in_flight == 0 {
+            return false;
+        }
+        transfer.last_activity.elapsed() > threshold
+    }
+
+    /// Resets the request window for a stalled transfer, re-requesting from
+    /// the current write offset. Returns the new fetch requests.
+    pub async fn restart_stalled(
+        &mut self,
+        peer: PeerId,
+        path: &str,
+    ) -> Vec<SyncRequest> {
+        let Some(transfer) = self.pending.get_mut(&(peer, path.to_string())) else {
+            return Vec::new();
+        };
+
+        // Reset in-flight counter: we assume all outstanding requests are lost.
+        transfer.in_flight = 0;
+        transfer.next_request_offset = transfer.write_offset;
+        transfer.last_activity = std::time::Instant::now();
+
+        let mut requests = Vec::new();
+        let window = configured_window_requests();
+        let chunk_size = configured_chunk_size() as u64;
+        while transfer.in_flight < window {
+            let offset = transfer.next_request_offset;
+            if let Some(total) = transfer.total_size {
+                if offset >= total {
+                    break;
+                }
+            }
+            requests.push(SyncRequest::FetchFile {
+                path: path.to_string(),
+                offset,
+            });
+            transfer.in_flight += 1;
+            transfer.next_request_offset = offset + chunk_size;
+        }
+        requests
+    }
+
     /// Removes transfers that have been pending longer than `max_age` without
-    /// completing. Returns the number of removed transfers.
+    /// any activity (chunk received or request sent). Returns the number of
+    /// removed transfers.
     pub async fn cleanup_stale_transfers(&mut self, max_age: std::time::Duration) -> usize {
         let now = std::time::Instant::now();
         let stale: Vec<(PeerId, String)> = self
             .pending
             .iter()
-            .filter(|(_, transfer)| now.duration_since(transfer.started_at) > max_age)
+            .filter(|(_, transfer)| now.duration_since(transfer.last_activity) > max_age)
             .map(|((peer, path), _)| (*peer, path.clone()))
             .collect();
 
         let count = stale.len();
         for (peer, path) in stale {
-            eprintln!("sync: removing stale transfer for {path} from {peer} (pending > {max_age:?})");
+            eprintln!("sync: removing stale transfer for {path} from {peer} (no activity > {max_age:?})");
             let _ = self.cancel(peer, &path).await;
         }
         count
@@ -599,7 +643,7 @@ impl SyncState {
                 last_log_offset: 0,
                 buffered: BTreeMap::new(),
                 hasher: Sha256::new(),
-                started_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
             },
         );
 
@@ -634,6 +678,7 @@ impl SyncState {
 
         transfer.total_size = Some(total_size);
         transfer.in_flight = transfer.in_flight.saturating_sub(1);
+        transfer.last_activity = std::time::Instant::now();
 
         // Empty files complete immediately: there is nothing to request.
         if total_size == 0 {

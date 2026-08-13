@@ -39,9 +39,12 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
 const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
 // Generous per-request timeout: large chunks on slow links must not time out.
-const SYNC_REQUEST_TIMEOUT_SECS: u64 = 60;
+// 5 minutes allows for very slow connections and large chunks.
+const SYNC_REQUEST_TIMEOUT_SECS: u64 = 300;
 // How often a failed chunk request is retried before the transfer is aborted.
-const MAX_FETCH_RETRIES: u32 = 3;
+const MAX_FETCH_RETRIES: u32 = 5;
+// Stale transfers are aborted after 10 minutes without progress.
+const STALE_TRANSFER_TIMEOUT_SECS: u64 = 600;
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -248,7 +251,7 @@ pub async fn run_discovery(
         tokio::select! {
             _ = cleanup_interval.tick() => {
                 let removed = sync_state
-                    .cleanup_stale_transfers(Duration::from_secs(120))
+                    .cleanup_stale_transfers(Duration::from_secs(STALE_TRANSFER_TIMEOUT_SECS))
                     .await;
                 if removed > 0 {
                     eprintln!("sync: cleaned up {removed} stale transfer(s)");
@@ -384,11 +387,19 @@ pub async fn run_discovery(
                             continue;
                         }
                         if attempts + 1 >= MAX_FETCH_RETRIES {
+                            // After too many failures, restart the transfer from the
+                            // current write offset instead of giving up entirely.
                             eprintln!(
-                                "sync: giving up on {path} from {fetch_peer} after {MAX_FETCH_RETRIES} failed attempts: {error}"
+                                "sync: too many failures for {path} from {fetch_peer}; restarting from last write position"
                             );
-                            if let Err(err) = sync_state.cancel_transfer(fetch_peer, &path).await {
-                                eprintln!("failed to cancel transfer for {path}: {err}");
+                            let restart_requests = sync_state.restart_stalled(fetch_peer, &path).await;
+                            for request in restart_requests {
+                                if let SyncRequest::FetchFile { path, offset } = &request {
+                                    let path = path.clone();
+                                    let offset = *offset;
+                                    let id = swarm.behaviour_mut().sync.send_request(&fetch_peer, request);
+                                    pending_fetches.insert(id, (fetch_peer, path, offset, 0));
+                                }
                             }
                             continue;
                         }
