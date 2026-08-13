@@ -236,6 +236,11 @@ pub async fn run_discovery(
                     if let Some(peer) = connected_peers.iter().next().copied() {
                         let id = swarm.behaviour_mut().sync.send_request(&peer, request);
                         pending_fetches.insert(id, (peer, path, offset, 0));
+                    } else {
+                        // No peer connected right now (e.g. reconnect in
+                        // progress); put the request back so it is retried
+                        // once a peer is available again.
+                        fetch_queue.push(request).await;
                     }
                 }
             }

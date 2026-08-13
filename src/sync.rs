@@ -604,6 +604,20 @@ impl SyncState {
         transfer.total_size = Some(total_size);
         transfer.in_flight = transfer.in_flight.saturating_sub(1);
 
+        // Empty files complete immediately: there is nothing to request.
+        if total_size == 0 {
+            let transfer = self.pending.remove(&key).expect("checked above");
+            drop(transfer.file);
+            let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
+            // Materialize an empty file at the destination.
+            if let Some(parent) = transfer.final_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&transfer.final_path, b"").await?;
+            println!("sync: finalized empty file {}", transfer.final_path.display());
+            return Ok(Vec::new());
+        }
+
         if data.is_empty() {
             // Chunks we already passed (e.g. a retried request racing the
             // original response) carry no new data; just refill the window.
