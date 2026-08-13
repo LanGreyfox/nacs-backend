@@ -10,7 +10,7 @@ use std::{
 
 use libp2p::{
     core::{transport::PortUse, upgrade::DeniedUpgrade, Endpoint, Multiaddr},
-    futures::StreamExt,
+    futures::{FutureExt, StreamExt},
     identity,
     mdns,
     noise,
@@ -225,27 +225,26 @@ pub async fn run_discovery(
     let mut chunk_reader = sync::ChunkReader::new();
     let mut pending_fetches: HashMap<OutboundRequestId, (PeerId, String, u64, u32)> = HashMap::new();
     loop {
-        tokio::select! {
-            // Priority: queued fetch requests are sent before new swarm events
-            // are processed, so the request window refills promptly.
-            biased;
-            Some(request) = fetch_queue.pop() => {
-                if let SyncRequest::FetchFile { path, offset } = &request {
-                    let path = path.clone();
-                    let offset = *offset;
-                    if let Some(peer) = connected_peers.iter().next().copied() {
-                        let id = swarm.behaviour_mut().sync.send_request(&peer, request);
-                        pending_fetches.insert(id, (peer, path, offset, 0));
-                    } else {
-                        // No peer connected right now (e.g. reconnect in
-                        // progress); put the request back so it is retried
-                        // once a peer is available again.
-                        fetch_queue.push(request).await;
-                    }
+        // Drain all queued fetch requests before waiting for new swarm events.
+        while let Some(request) = fetch_queue.pop().await {
+            if let SyncRequest::FetchFile { path, offset } = &request {
+                let path = path.clone();
+                let offset = *offset;
+                if let Some(peer) = connected_peers.iter().next().copied() {
+                    let id = swarm.behaviour_mut().sync.send_request(&peer, request);
+                    pending_fetches.insert(id, (peer, path, offset, 0));
+                } else {
+                    // No peer connected right now (e.g. reconnect in
+                    // progress); put the request back so it is retried
+                    // once a peer is available again.
+                    fetch_queue.push(request).await;
+                    break;
                 }
             }
-            event = swarm.select_next_some() => {
-                match event {
+        }
+
+        let event = swarm.select_next_some().await;
+        match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("p2p listening on {address}");
                     }
@@ -461,14 +460,14 @@ pub async fn run_discovery(
                     },
                     _ => {}
                 }
-            }
-            Some(change_event) = announce_rx.recv() => {
-                for peer in connected_peers.iter() {
-                    swarm
-                        .behaviour_mut()
-                        .sync
-                        .send_request(peer, SyncRequest::Event(change_event.clone()));
-                }
+
+        // Broadcast locally-originated change events to all connected peers.
+        if let Some(change_event) = announce_rx.recv().now_or_never().flatten() {
+            for peer in connected_peers.iter() {
+                swarm
+                    .behaviour_mut()
+                    .sync
+                    .send_request(peer, SyncRequest::Event(change_event.clone()));
             }
         }
     }

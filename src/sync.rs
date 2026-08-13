@@ -425,6 +425,8 @@ struct PendingTransfer {
     in_flight: usize,
     /// Next offset to write to disk.
     write_offset: u64,
+    /// Last offset at which progress was logged.
+    last_log_offset: u64,
     /// Chunks that arrived ahead of their position, keyed by offset.
     buffered: BTreeMap<u64, Vec<u8>>,
     /// Rolling checksum over the bytes written so far.
@@ -567,6 +569,7 @@ impl SyncState {
                 next_request_offset: 0,
                 in_flight: 0,
                 write_offset: 0,
+                last_log_offset: 0,
                 buffered: BTreeMap::new(),
                 hasher: Sha256::new(),
             },
@@ -632,6 +635,28 @@ impl SyncState {
             transfer.file.write_all(&chunk).await?;
             transfer.hasher.update(&chunk);
             transfer.write_offset += chunk.len() as u64;
+        }
+
+        // Log progress every ~10% or every 50 MiB, whichever is smaller.
+        let chunk_size = configured_chunk_size() as u64;
+        let log_interval = (total_size / 10).min(50 * 1024 * 1024).max(chunk_size);
+        if transfer.write_offset >= transfer.last_log_offset + log_interval
+            || transfer.write_offset == total_size
+        {
+            transfer.last_log_offset = transfer.write_offset;
+            let pct = if total_size > 0 {
+                transfer.write_offset as f64 / total_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "sync: {} {:.1}% ({}/{} bytes, {} in-flight)",
+                transfer.resource_path,
+                pct,
+                transfer.write_offset,
+                total_size,
+                transfer.in_flight
+            );
         }
 
         if transfer.write_offset < total_size {
