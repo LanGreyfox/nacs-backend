@@ -3,6 +3,8 @@
 This repository contains a WebDAV server built with dav-server and Tokio.
 
 The server also persists WebDAV file events to SQLite through a background worker.
+It now includes a P2P file replication layer that can exchange manifests and
+transfer file contents in chunked pull-based requests.
 
 ## Requirements
 
@@ -14,9 +16,11 @@ The server also persists WebDAV file events to SQLite through a background worke
 - `src/webdav.rs` — WebDAV request handling, auth, and event mapping
 - `src/db.rs` — SQLite persistence layer and background worker
 - `src/p2p.rs` — libp2p discovery, heartbeat, and peer connection lifecycle
+- `src/sync.rs` — P2P file replication protocol, manifest diffing, and chunked transfers
 - `tests/webdav_tests.rs` — WebDAV helper tests
 - `tests/db_tests.rs` — SQLite persistence integration tests
 - `tests/p2p_tests.rs` — P2P identity/discovery helper tests
+- `tests/sync_tests.rs` — P2P sync protocol and chunk transfer tests
 
 ## Default configuration
 
@@ -26,24 +30,26 @@ The server also persists WebDAV file events to SQLite through a background worke
 - SQLite directory: `./sqlite` (created automatically)
 
 The SQLite database file is stored as `./sqlite/webdav.db`.
-The persistent P2P identity key is stored as `./sqlite/p2p_identity.key`.
+The persistent P2P identity key is stored in `./sqlite/`.
+By default port `4001` uses `./sqlite/p2p_identity.key`; other P2P ports use `./sqlite/p2p_identity-<port>.key` so multiple local nodes do not share the same PeerId.
 
 You can override host and port with environment variables:
 
 - `WEBDAV_HOST` — bind host/IP (default: `127.0.0.1`)
 - `WEBDAV_PORT` — bind port (default: `4918`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
+- `SYNC_CHUNK_SIZE_BYTES` — P2P sync chunk size in bytes (default: `2097152`, i.e. 2 MiB)
 
 ## Authentication
 
-This server enforces HTTP Basic Authentication. Credentials are read from environment variables at startup:
+This server enforces HTTP Basic Authentication for WebDAV requests. Credentials are read from environment variables at startup:
 
 - `WEBDAV_USER` — username
 - `WEBDAV_PASS` — password
 
-The server expects the environment variables to be set; it will exit with an error if they are missing.
+The server expects these variables to be set; it exits with an error if either is missing.
 
-The server also allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
+The server allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
 
 ## Persistence
 
@@ -61,15 +67,27 @@ Each stored record includes the current folder, whether the resource is a file o
 
 - Discovery uses mDNS on the local network.
 - Transport uses TCP with Noise encryption and Yamux multiplexing.
+- The transport is encrypted, but peers are not yet mutually authenticated.
 - Swarm idle timeout is set to 60 seconds.
 - Ping heartbeat runs every 10 seconds with an 8-second timeout.
 - A custom keepalive behaviour is enabled so established connections stay open even though ping streams are excluded from keepalive in this libp2p version.
 
+## P2P sync
+
+- Nodes exchange a manifest that includes live resources and tombstones.
+- Sync decisions are made with last-write-wins timestamp comparison.
+- File contents are pulled on demand through `FetchFile` requests and `Chunk` responses.
+- Transfers are limited to 2 MiB per chunk by default and are verified with SHA-256 before the file is materialized locally.
+- You can tune chunk size via `SYNC_CHUNK_SIZE_BYTES`; invalid values fall back to the default with a warning.
+- The wire protocol uses libp2p request-response with CBOR encoding under `/nacs-backend/sync/1`.
+
+This keeps the sync path bounded in memory and avoids eager pushes of file bytes.
+
 Current failure/reconnect semantics:
 
 - On heartbeat failure, the peer is removed from active peer tracking immediately.
-- There is no dedicated reconnect backoff scheduler at the moment.
-- Reconnect attempts happen through the normal discovery/dial flow when peers are discovered again.
+- Failed dials and disconnects are not retried automatically.
+- Reconnect happens only when mDNS discovers the peer again.
 
 ## Build & Run
 
@@ -81,6 +99,7 @@ export WEBDAV_PASS="yourpassword"
 export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
 export P2P_PORT="4001"
+export SYNC_CHUNK_SIZE_BYTES="2097152"
 cargo run
 ```
 
@@ -93,19 +112,19 @@ Start three instances in separate terminals so each node has unique WebDAV and P
 Terminal 1:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Terminal 2:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Terminal 3:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
 ```
 
 Expected behavior:
@@ -113,6 +132,7 @@ Expected behavior:
 - Every instance logs its own peer ID (`p2p node started: ...`).
 - Every instance logs discovered peers (`new node discovered: <peer_id>`).
 - With one single instance running, discovery stays idle without errors (0 neighbors).
+- Make sure each node uses a different `P2P_PORT`; the identity key path is derived from that port so peers do not collide on the same checkout.
 
 On first start the application creates `./sqlite/webdav.db` automatically.
 On later starts, the existing database is reused.
@@ -134,6 +154,8 @@ Linux Dolphin example URL:
 - The Basic Auth header is parsed as standard HTTP Basic Auth (`Authorization: Basic <base64(user:pass)>`) and then compared to `WEBDAV_USER`/`WEBDAV_PASS`.
 - SQLite writes are handled by a dedicated background worker, so the WebDAV request path stays responsive.
 - Checksum values are computed for files and stored in the database.
+- P2P sync currently replicates file and folder state by exchanging manifests and pulling content only when needed.
+- For P2P, encryption is enabled at the transport layer, but mutual peer authentication is still a planned enhancement.
 - If you prefer a different behavior (for example: allow missing credentials, read from a config file, or support multiple users), I can update the implementation accordingly.
 
 ## License

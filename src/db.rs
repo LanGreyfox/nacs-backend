@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const DB_FILENAME: &str = "webdav.db";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
     Created,
     Edited,
@@ -42,9 +43,37 @@ pub struct EventEnvelope {
     pub event_kind: EventKind,
     pub source_path: String,
     pub destination_path: Option<String>,
+    pub checksum: Option<String>,
     pub method: String,
     pub status_code: u16,
     pub username: String,
+}
+
+/// A single currently-live resource, as reported to peers during manifest exchange.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestEntry {
+    pub resource_path: String,
+    pub resource_kind: String,
+    pub checksum: Option<String>,
+    pub size: u64,
+    pub updated_at: String,
+}
+
+/// A tombstone for a path that used to exist but was deleted and has not
+/// been recreated since. Derived from `resource_archive` rows whose path is
+/// no longer present in `resources`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TombstoneEntry {
+    pub resource_path: String,
+    pub deleted_at: String,
+}
+
+/// Full snapshot of a node's known resource state, exchanged with peers to
+/// drive initial reconciliation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    pub resources: Vec<ManifestEntry>,
+    pub tombstones: Vec<TombstoneEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +108,7 @@ pub struct Database {
 
 enum Command {
     Record(EventEnvelope),
+    Manifest(oneshot::Sender<Result<Manifest, String>>),
 }
 
 impl Database {
@@ -102,6 +132,22 @@ impl Database {
 
     pub fn record(&self, event: EventEnvelope) {
         let _ = self.tx.send(Command::Record(event));
+    }
+
+    /// Fetches a full snapshot of currently-live resources plus tombstones
+    /// for paths that were deleted and not recreated since. Used to drive
+    /// initial reconciliation with a newly discovered peer.
+    pub async fn manifest(&self) -> io::Result<Manifest> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Manifest(reply_tx))
+            .map_err(|_| io::Error::other("sqlite worker has shut down"))?;
+
+        match reply_rx.await {
+            Ok(Ok(manifest)) => Ok(manifest),
+            Ok(Err(err)) => Err(io::Error::other(err)),
+            Err(_) => Err(io::Error::other("sqlite worker dropped manifest request")),
+        }
     }
 }
 
@@ -132,6 +178,10 @@ fn run_worker(
                 if let Err(err) = apply_event(&mut conn, &data_dir, event) {
                     eprintln!("failed to persist webdav event: {err}");
                 }
+            }
+            Command::Manifest(reply_tx) => {
+                let result = build_manifest(&conn, &data_dir).map_err(|err| err.to_string());
+                let _ = reply_tx.send(result);
             }
         }
     }
@@ -208,6 +258,190 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manifest> {
+    let mut resources_stmt = conn.prepare(
+        r#"
+        SELECT resource_path, resource_kind, checksum, updated_at
+        FROM resources
+        "#,
+    )?;
+    let mut resources: Vec<ManifestEntry> = resources_stmt
+        .query_map([], |row| {
+            let resource_path: String = row.get(0)?;
+            let resource_kind: String = row.get(1)?;
+            let checksum: Option<String> = row.get(2)?;
+            let updated_at: String = row.get(3)?;
+            Ok((resource_path, resource_kind, checksum, updated_at))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(resource_path, resource_kind, checksum, updated_at)| {
+            let size = if resource_kind == "folder" {
+                0
+            } else {
+                file_size(data_dir, &resource_path).unwrap_or(0)
+            };
+            ManifestEntry {
+                resource_path,
+                resource_kind,
+                checksum,
+                size,
+                updated_at,
+            }
+        })
+        .collect();
+
+    let mut seen_paths = resources
+        .iter()
+        .map(|entry| entry.resource_path.clone())
+        .collect::<HashSet<_>>();
+    scan_data_dir(data_dir, data_dir, &mut resources, &mut seen_paths).unwrap_or_else(|err| {
+        eprintln!("failed to scan data directory for manifest reconciliation: {err}");
+    });
+
+    let mut tombstones_stmt = conn.prepare(
+        r#"
+        SELECT resource_path, MAX(archived_at)
+        FROM resource_archive
+        WHERE archived_reason = 'delete'
+          AND resource_path NOT IN (SELECT resource_path FROM resources)
+        GROUP BY resource_path
+        "#,
+    )?;
+    let tombstones = tombstones_stmt
+        .query_map([], |row| {
+            Ok(TombstoneEntry {
+                resource_path: row.get(0)?,
+                deleted_at: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Manifest {
+        resources,
+        tombstones,
+    })
+}
+
+fn file_size(data_dir: &Path, webdav_path: &str) -> io::Result<u64> {
+    let decoded = percent_decode_lossy(webdav_path);
+    let rel = decoded.trim_start_matches('/');
+    let metadata = fs::metadata(data_dir.join(rel))?;
+    Ok(metadata.len())
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_sync_temp_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".p2p-tmp"))
+}
+
+fn scan_data_dir(
+    data_dir: &Path,
+    current_dir: &Path,
+    resources: &mut Vec<ManifestEntry>,
+    seen_paths: &mut HashSet<String>,
+) -> io::Result<()> {
+    if is_sync_temp_path(current_dir) {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(current_dir)?;
+    let relative_path = current_dir.strip_prefix(data_dir).unwrap_or_else(|_| Path::new(""));
+    let resource_path = webdav_path(relative_path);
+
+    if metadata.is_dir() {
+        if seen_paths.insert(resource_path.clone()) {
+            resources.push(ManifestEntry {
+                resource_path: resource_path.clone(),
+                resource_kind: "folder".to_string(),
+                checksum: None,
+                size: 0,
+                updated_at: updated_at_for_path(current_dir),
+            });
+        }
+
+        for entry in fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == current_dir {
+                continue;
+            }
+            scan_data_dir(data_dir, &path, resources, seen_paths)?;
+        }
+    } else if metadata.is_file() {
+        if seen_paths.insert(resource_path.clone()) {
+            let (checksum, size) = file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
+            resources.push(ManifestEntry {
+                resource_path: resource_path.clone(),
+                resource_kind: "file".to_string(),
+                checksum: Some(checksum),
+                size,
+                updated_at: updated_at_for_path(current_dir),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn webdav_path(path: &Path) -> String {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_string_lossy().into_owned()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {}
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+fn updated_at_for_path(path: &Path) -> String {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().to_string(),
+        Err(err) => err.duration().as_nanos().to_string(),
+    }
+}
+
 fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     let source_path = normalize_path(&event.source_path);
@@ -222,7 +456,10 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
     let mut checksum = if resource_kind == ResourceKind::Folder {
         None
     } else {
-        compute_checksum(data_dir, &final_path).ok().flatten()
+        event
+            .checksum
+            .clone()
+            .or_else(|| compute_checksum(data_dir, &final_path).ok().flatten())
     };
 
     let mut archive_resource_id = None;
@@ -492,11 +729,23 @@ fn resolve_resource_kind(event_kind: EventKind, existing: Option<&ResourceRow>) 
 }
 
 fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<String>> {
-    let rel = webdav_path.trim_start_matches('/');
+    Ok(file_checksum_and_size(data_dir, webdav_path)?.map(|(checksum, _size)| checksum))
+}
+
+/// Computes the SHA-256 checksum and byte size of a resource on disk. Shared
+/// by the local event-recording path and the WebDAV layer, which needs the
+/// same values to announce changes to p2p peers.
+pub(crate) fn file_checksum_and_size(
+    data_dir: &Path,
+    webdav_path: &str,
+) -> io::Result<Option<(String, u64)>> {
+    let decoded = percent_decode_lossy(webdav_path);
+    let rel = decoded.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
     let mut file = fs::File::open(&fs_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
+    let mut size: u64 = 0;
 
     loop {
         let read = file.read(&mut buffer)?;
@@ -504,9 +753,10 @@ fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<Str
             break;
         }
         hasher.update(&buffer[..read]);
+        size += read as u64;
     }
 
-    Ok(Some(format!("{:x}", hasher.finalize())))
+    Ok(Some((format!("{:x}", hasher.finalize()), size)))
 }
 
 fn normalize_path(path: &str) -> String {

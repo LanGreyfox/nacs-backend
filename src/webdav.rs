@@ -1,6 +1,7 @@
-use std::{convert::Infallible, io, net::SocketAddr, path::Path};
+use std::{convert::Infallible, io, net::SocketAddr, path::{Path, PathBuf}};
 
-use crate::db::{Database, EventEnvelope, EventKind};
+use crate::db::{file_checksum_and_size, Database, EventEnvelope, EventKind};
+use crate::sync::{FileChangeEvent, P2pHandle};
 use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
 use dav_server::body::Body;
 use hyper::{header::HeaderMap, server::conn::http1, service::service_fn, Method, Response, StatusCode, Uri};
@@ -109,6 +110,63 @@ fn destination_path(destination: &str) -> &str {
     destination
 }
 
+fn normalize_destination(destination: &str) -> String {
+    let path = destination_path(destination)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/");
+    let path = percent_decode_lossy(path);
+
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn normalize_request_path(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let path = percent_decode_lossy(path);
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Returns the parent directory portion of an absolute path.
 /// `/a/b/c` → `/a/b`, `/file.txt` → `/`, `/` → `/`.
 fn parent_path(path: &str) -> &str {
@@ -140,7 +198,8 @@ pub fn map_to_event(
         },
         "MOVE" => match status {
             StatusCode::CREATED | StatusCode::NO_CONTENT => {
-                let src_parent = parent_path(uri.path());
+                let normalized_src = normalize_request_path(uri.path());
+                let src_parent = parent_path(&normalized_src);
                 let is_rename = destination
                     .map(|dest| parent_path(destination_path(dest)) == src_parent)
                     .unwrap_or(false);
@@ -269,11 +328,57 @@ fn required_env_var(name: &str) -> io::Result<String> {
     })
 }
 
-pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Database) -> io::Result<()> {
+#[doc(hidden)]
+pub fn spawn_p2p_announcement(
+    event_kind: EventKind,
+    source_path: String,
+    destination_path: Option<String>,
+    username: String,
+    method: String,
+    status_code: u16,
+    data_dir: PathBuf,
+    final_path: String,
+    database: Database,
+    p2p: P2pHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let (checksum, size) = match file_checksum_and_size(&data_dir, &final_path) {
+            Ok(Some((checksum, size))) => (Some(checksum), size),
+            Ok(None) | Err(_) => (None, 0),
+        };
+
+        database.record(EventEnvelope {
+            event_kind,
+            source_path: source_path.clone(),
+            destination_path: destination_path.clone(),
+            checksum: checksum.clone(),
+            method,
+            status_code,
+            username: username.clone(),
+        });
+
+        p2p.announce(FileChangeEvent {
+            event_kind,
+            source_path,
+            destination_path,
+            checksum,
+            size,
+            username,
+        });
+    })
+}
+
+pub async fn run_server(
+    addr: SocketAddr,
+    dir: impl AsRef<Path>,
+    database: Database,
+    p2p: P2pHandle,
+) -> io::Result<()> {
     ensure_data_dir(dir.as_ref()).await?;
     // Read credentials from environment
     let username = required_env_var("WEBDAV_USER")?;
     let password = required_env_var("WEBDAV_PASS")?;
+    let data_dir = dir.as_ref().to_path_buf();
 
     let dav_server = build_handler(dir.as_ref());
     let listener = TcpListener::bind(addr).await?;
@@ -284,6 +389,8 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
         let (stream, _) = listener.accept().await?;
         let dav_server = dav_server.clone();
         let database = database.clone();
+        let p2p = p2p.clone();
+        let data_dir = data_dir.clone();
         let username = username.clone();
         let password = password.clone();
         let io = TokioIo::new(stream);
@@ -298,6 +405,8 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
                             let username = username.clone();
                             let password = password.clone();
                             let database = database.clone();
+                            let p2p = p2p.clone();
+                            let data_dir = data_dir.clone();
                             async move {
                                 let method = req.method().clone();
                                 let uri = req.uri().clone();
@@ -311,7 +420,7 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
                                     .headers()
                                     .get("Destination")
                                     .and_then(|v| v.to_str().ok())
-                                    .map(|s| s.to_string());
+                                    .map(normalize_destination);
 
                                 let authorized = is_authorized(req.headers(), &username, &password, &method);
 
@@ -340,14 +449,51 @@ pub async fn run_server(addr: SocketAddr, dir: impl AsRef<Path>, database: Datab
                                 let status = response.status();
                                 let event = map_to_event(&method, status, &uri, destination.as_deref());
                                 if let Some(event_kind) = event_kind_for_storage(&event) {
-                                    database.record(EventEnvelope {
+                                    let source_path = normalize_request_path(uri.path());
+                                    let final_path =
+                                        destination.clone().unwrap_or_else(|| source_path.clone());
+                                    let should_hash = matches!(
                                         event_kind,
-                                        source_path: uri.path().to_string(),
-                                        destination_path: destination.clone(),
-                                        method: method.as_str().to_string(),
-                                        status_code: status.as_u16(),
-                                        username: username.clone(),
-                                    });
+                                        EventKind::Created
+                                            | EventKind::Edited
+                                            | EventKind::Renamed
+                                            | EventKind::Moved
+                                            | EventKind::Copied
+                                    );
+
+                                    if should_hash {
+                                        spawn_p2p_announcement(
+                                            event_kind,
+                                            source_path,
+                                            destination.clone(),
+                                            username.clone(),
+                                            method.as_str().to_string(),
+                                            status.as_u16(),
+                                            data_dir.clone(),
+                                            final_path,
+                                            database.clone(),
+                                            p2p.clone(),
+                                        );
+                                    } else {
+                                        database.record(EventEnvelope {
+                                            event_kind,
+                                            source_path: source_path.clone(),
+                                            destination_path: destination.clone(),
+                                            checksum: None,
+                                            method: method.as_str().to_string(),
+                                            status_code: status.as_u16(),
+                                            username: username.clone(),
+                                        });
+
+                                        p2p.announce(FileChangeEvent {
+                                            event_kind,
+                                            source_path,
+                                            destination_path: destination.clone(),
+                                            checksum: None,
+                                            size: 0,
+                                            username: username.clone(),
+                                        });
+                                    }
                                 }
                                 log_file_event(&event, &method, &uri, status, &user_agent);
 
