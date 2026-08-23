@@ -101,7 +101,7 @@ struct ResourceRow {
     checksum_algorithm: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Database {
     tx: mpsc::UnboundedSender<Command>,
 }
@@ -400,18 +400,16 @@ fn scan_data_dir(
             }
             scan_data_dir(data_dir, &path, resources, seen_paths)?;
         }
-    } else if metadata.is_file() {
-        if seen_paths.insert(resource_path.clone()) {
-            let (checksum, size) =
-                file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
-            resources.push(ManifestEntry {
-                resource_path: resource_path.clone(),
-                resource_kind: "file".to_string(),
-                checksum: Some(checksum),
-                size,
-                updated_at: updated_at_for_path(current_dir),
-            });
-        }
+    } else if metadata.is_file() && seen_paths.insert(resource_path.clone()) {
+        let (checksum, size) =
+            file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
+        resources.push(ManifestEntry {
+            resource_path: resource_path.clone(),
+            resource_kind: "file".to_string(),
+            checksum: Some(checksum),
+            size,
+            updated_at: updated_at_for_path(current_dir),
+        });
     }
 
     Ok(())
@@ -437,7 +435,7 @@ fn webdav_path(path: &Path) -> String {
 fn updated_at_for_path(path: &Path) -> String {
     let modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
-        .unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+        .unwrap_or(SystemTime::UNIX_EPOCH);
 
     match modified.duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_nanos().to_string(),
@@ -481,22 +479,21 @@ fn apply_event(
             }
         }
         EventKind::Renamed | EventKind::Moved => {
-            if let Some(path) = destination_path.as_deref() {
-                if let Some(destination_row) = load_resource(&tx, path)? {
-                    if source_row.as_ref().map(|row| row.id) != Some(destination_row.id) {
-                        archive_resource_id = Some(archive_resource(
-                            &tx,
-                            &destination_row,
-                            "move",
-                            &event,
-                            None,
-                        )?);
-                        tx.execute(
-                            "DELETE FROM resources WHERE id = ?1",
-                            params![destination_row.id],
-                        )?;
-                    }
-                }
+            if let Some(path) = destination_path.as_deref()
+                && let Some(destination_row) = load_resource(&tx, path)?
+                && source_row.as_ref().map(|row| row.id) != Some(destination_row.id)
+            {
+                archive_resource_id = Some(archive_resource(
+                    &tx,
+                    &destination_row,
+                    "move",
+                    &event,
+                    None,
+                )?);
+                tx.execute(
+                    "DELETE FROM resources WHERE id = ?1",
+                    params![destination_row.id],
+                )?;
             }
 
             if let Some(row) = source_row.as_ref() {
@@ -538,20 +535,20 @@ fn apply_event(
             }
         }
         EventKind::Copied => {
-            if let Some(path) = destination_path.as_deref() {
-                if let Some(destination_row) = load_resource(&tx, path)? {
-                    archive_resource_id = Some(archive_resource(
-                        &tx,
-                        &destination_row,
-                        "copy_replace",
-                        &event,
-                        None,
-                    )?);
-                    tx.execute(
-                        "DELETE FROM resources WHERE id = ?1",
-                        params![destination_row.id],
-                    )?;
-                }
+            if let Some(path) = destination_path.as_deref()
+                && let Some(destination_row) = load_resource(&tx, path)?
+            {
+                archive_resource_id = Some(archive_resource(
+                    &tx,
+                    &destination_row,
+                    "copy_replace",
+                    &event,
+                    None,
+                )?);
+                tx.execute(
+                    "DELETE FROM resources WHERE id = ?1",
+                    params![destination_row.id],
+                )?;
             }
 
             insert_or_replace_resource(&tx, &final_path, resource_kind, checksum.clone(), &event)?;
@@ -790,7 +787,6 @@ fn current_folder(path: &str) -> String {
 
     match path.rsplit_once('/') {
         Some(("", _)) | None => "/".to_string(),
-        Some((parent, _)) if parent.is_empty() => "/".to_string(),
         Some((parent, _)) => parent.to_string(),
     }
 }

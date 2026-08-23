@@ -106,12 +106,10 @@ pub enum FileEvent {
 /// Extracts the path component from a `Destination` header value, which may be
 /// either a full URL (`http://host/path`) or a plain absolute path (`/path`).
 fn destination_path(destination: &str) -> &str {
-    if destination.starts_with("http://") {
-        let after = &destination[7..];
+    if let Some(after) = destination.strip_prefix("http://") {
         return after.find('/').map(|i| &after[i..]).unwrap_or("/");
     }
-    if destination.starts_with("https://") {
-        let after = &destination[8..];
+    if let Some(after) = destination.strip_prefix("https://") {
         return after.find('/').map(|i| &after[i..]).unwrap_or("/");
     }
     destination
@@ -336,18 +334,34 @@ fn required_env_var(name: &str) -> io::Result<String> {
 }
 
 #[doc(hidden)]
-pub fn spawn_p2p_announcement(
-    event_kind: EventKind,
-    source_path: String,
-    destination_path: Option<String>,
-    username: String,
-    method: String,
-    status_code: u16,
-    data_dir: PathBuf,
-    final_path: String,
-    database: Database,
-    p2p: P2pHandle,
-) -> tokio::task::JoinHandle<()> {
+#[derive(Debug)]
+pub struct SpawnP2pAnnouncementParams {
+    pub event_kind: EventKind,
+    pub source_path: String,
+    pub destination_path: Option<String>,
+    pub username: String,
+    pub method: String,
+    pub status_code: u16,
+    pub data_dir: PathBuf,
+    pub final_path: String,
+    pub database: Database,
+    pub p2p: P2pHandle,
+}
+
+#[doc(hidden)]
+pub fn spawn_p2p_announcement(params: SpawnP2pAnnouncementParams) -> tokio::task::JoinHandle<()> {
+    let SpawnP2pAnnouncementParams {
+        event_kind,
+        source_path,
+        destination_path,
+        username,
+        method,
+        status_code,
+        data_dir,
+        final_path,
+        database,
+        p2p,
+    } = params;
     tokio::task::spawn_blocking(move || {
         let (checksum, size) = match file_checksum_and_size(&data_dir, &final_path) {
             Ok(Some((checksum, size))) => (Some(checksum), size),
@@ -469,18 +483,18 @@ pub async fn run_server(
                                     );
 
                                     if should_hash {
-                                        spawn_p2p_announcement(
+                                        spawn_p2p_announcement(SpawnP2pAnnouncementParams {
                                             event_kind,
                                             source_path,
-                                            destination.clone(),
-                                            username.clone(),
-                                            method.as_str().to_string(),
-                                            status.as_u16(),
-                                            data_dir.clone(),
+                                            destination_path: destination.clone(),
+                                            username: username.clone(),
+                                            method: method.as_str().to_string(),
+                                            status_code: status.as_u16(),
+                                            data_dir: data_dir.clone(),
                                             final_path,
-                                            database.clone(),
-                                            p2p.clone(),
-                                        );
+                                            database: database.clone(),
+                                            p2p: p2p.clone(),
+                                        });
                                     } else {
                                         database.record(EventEnvelope {
                                             event_kind,

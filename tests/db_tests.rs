@@ -344,7 +344,7 @@ async fn manifest_includes_existing_files_and_directories_without_prior_events()
     let sqlite_dir = base_dir.join("sqlite");
 
     fs::create_dir_all(&data_dir).expect("data dir should be created");
-    fs::create_dir_all(&data_dir.join("docs")).expect("docs dir should be created");
+    fs::create_dir_all(data_dir.join("docs")).expect("docs dir should be created");
     fs::write(data_dir.join("docs/readme.txt"), b"hello from disk")
         .expect("test file should be created");
 

@@ -8,8 +8,8 @@ use hyper::{Method, StatusCode};
 use nacs_backend::db::{Database, EventKind};
 use nacs_backend::sync::P2pHandle;
 use nacs_backend::webdav::{
-    FileEvent, build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials,
-    spawn_p2p_announcement,
+    FileEvent, SpawnP2pAnnouncementParams, build_unauthorized_response, ensure_data_dir,
+    map_to_event, parse_basic_credentials, spawn_p2p_announcement,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -311,18 +311,18 @@ async fn spawn_p2p_announcement_computes_checksum_in_background() {
         .expect("database should open");
 
     let (p2p, mut rx) = P2pHandle::channel();
-    let handle = spawn_p2p_announcement(
-        EventKind::Created,
-        "/report.txt".to_string(),
-        None,
-        "user".to_string(),
-        "PUT".to_string(),
-        201,
-        data_dir.clone(),
-        "/report.txt".to_string(),
+    let handle = spawn_p2p_announcement(SpawnP2pAnnouncementParams {
+        event_kind: EventKind::Created,
+        source_path: "/report.txt".to_string(),
+        destination_path: None,
+        username: "user".to_string(),
+        method: "PUT".to_string(),
+        status_code: 201,
+        data_dir: data_dir.clone(),
+        final_path: "/report.txt".to_string(),
         database,
         p2p,
-    );
+    });
 
     handle.await.expect("background task should complete");
     let event = rx.recv().await.expect("announcement should be queued");
@@ -347,18 +347,18 @@ async fn spawn_p2p_announcement_falls_back_when_file_is_missing() {
         .expect("database should open");
 
     let (p2p, mut rx) = P2pHandle::channel();
-    let handle = spawn_p2p_announcement(
-        EventKind::Deleted,
-        "/missing.txt".to_string(),
-        None,
-        "user".to_string(),
-        "DELETE".to_string(),
-        204,
-        data_dir.clone(),
-        "/missing.txt".to_string(),
+    let handle = spawn_p2p_announcement(SpawnP2pAnnouncementParams {
+        event_kind: EventKind::Deleted,
+        source_path: "/missing.txt".to_string(),
+        destination_path: None,
+        username: "user".to_string(),
+        method: "DELETE".to_string(),
+        status_code: 204,
+        data_dir: data_dir.clone(),
+        final_path: "/missing.txt".to_string(),
         database,
         p2p,
-    );
+    });
 
     handle.await.expect("background task should complete");
     let event = rx.recv().await.expect("announcement should be queued");
