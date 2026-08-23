@@ -13,8 +13,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    env,
-    io,
+    env, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -23,7 +22,7 @@ use libp2p::PeerId;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
 };
 
 use crate::db::{self, Database, EventEnvelope, EventKind};
@@ -53,9 +52,7 @@ pub fn configured_chunk_size() -> usize {
 
     *CHUNK_SIZE.get_or_init(|| {
         let chunk_size = resolve_chunk_size_from_env(env::var(SYNC_CHUNK_SIZE_ENV));
-        println!(
-            "sync: configured chunk size = {chunk_size} bytes ({SYNC_CHUNK_SIZE_ENV})"
-        );
+        println!("sync: configured chunk size = {chunk_size} bytes ({SYNC_CHUNK_SIZE_ENV})");
         chunk_size
     })
 }
@@ -523,11 +520,7 @@ impl SyncState {
 
     /// Resets the request window for a stalled transfer, re-requesting from
     /// the current write offset. Returns the new fetch requests.
-    pub async fn restart_stalled(
-        &mut self,
-        peer: PeerId,
-        path: &str,
-    ) -> Vec<SyncRequest> {
+    pub async fn restart_stalled(&mut self, peer: PeerId, path: &str) -> Vec<SyncRequest> {
         let Some(transfer) = self.pending.get_mut(&(peer, path.to_string())) else {
             return Vec::new();
         };
@@ -571,7 +564,9 @@ impl SyncState {
 
         let count = stale.len();
         for (peer, path) in stale {
-            eprintln!("sync: removing stale transfer for {path} from {peer} (no activity > {max_age:?})");
+            eprintln!(
+                "sync: removing stale transfer for {path} from {peer} (no activity > {max_age:?})"
+            );
             let _ = self.cancel(peer, &path).await;
         }
         count
@@ -608,7 +603,10 @@ impl SyncState {
 
         let target_path = destination_path.as_deref().unwrap_or(&resource_path);
         let final_path = fs_path_from_wire_path(data_dir, target_path);
-        println!("sync: start pull for {resource_path} from peer {peer} -> {}", final_path.display());
+        println!(
+            "sync: start pull for {resource_path} from peer {peer} -> {}",
+            final_path.display()
+        );
         if let Some(parent) = final_path.parent() {
             println!("sync: ensure parent directory {}", parent.display());
             tokio::fs::create_dir_all(parent).await?;
@@ -690,7 +688,10 @@ impl SyncState {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&transfer.final_path, b"").await?;
-            println!("sync: finalized empty file {}", transfer.final_path.display());
+            println!(
+                "sync: finalized empty file {}",
+                transfer.final_path.display()
+            );
             return Ok(Vec::new());
         }
 
@@ -724,11 +725,7 @@ impl SyncState {
             };
             println!(
                 "sync: {} {:.1}% ({}/{} bytes, {} in-flight)",
-                transfer.resource_path,
-                pct,
-                transfer.write_offset,
-                total_size,
-                transfer.in_flight
+                transfer.resource_path, pct, transfer.write_offset, total_size, transfer.in_flight
             );
         }
 
@@ -819,7 +816,9 @@ pub struct ChunkReader {
 
 impl ChunkReader {
     pub fn new() -> Self {
-        Self { handles: Vec::new() }
+        Self {
+            handles: Vec::new(),
+        }
     }
 
     /// Reads one chunk of `path` at `offset` from `data_dir`. Never fails:
@@ -955,10 +954,7 @@ pub async fn handle_incoming_event(
     event: FileChangeEvent,
 ) -> io::Result<()> {
     let source_path = normalize_wire_path(&event.source_path);
-    let destination_path = event
-        .destination_path
-        .as_deref()
-        .map(normalize_wire_path);
+    let destination_path = event.destination_path.as_deref().map(normalize_wire_path);
 
     match event.event_kind {
         EventKind::Deleted => {
@@ -991,7 +987,9 @@ pub async fn handle_incoming_event(
             Ok(())
         }
         EventKind::Renamed | EventKind::Moved => {
-            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let dest = destination_path
+                .clone()
+                .unwrap_or_else(|| source_path.clone());
             let src_fs = fs_path_from_wire_path(data_dir, &source_path);
             let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
@@ -1015,7 +1013,11 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(())
             } else {
-                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
+                println!(
+                    "sync: missing source {}, start pull for {}",
+                    src_fs.display(),
+                    dest
+                );
                 state
                     .start_pull(
                         data_dir,
@@ -1032,7 +1034,9 @@ pub async fn handle_incoming_event(
             }
         }
         EventKind::Copied => {
-            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let dest = destination_path
+                .clone()
+                .unwrap_or_else(|| source_path.clone());
             let src_fs = fs_path_from_wire_path(data_dir, &source_path);
             let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
@@ -1056,7 +1060,11 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(())
             } else {
-                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
+                println!(
+                    "sync: missing source {}, start pull for {}",
+                    src_fs.display(),
+                    dest
+                );
                 state
                     .start_pull(
                         data_dir,
@@ -1170,4 +1178,3 @@ pub async fn apply_manifest_actions(
         }
     }
 }
-

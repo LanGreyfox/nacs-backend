@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
@@ -376,7 +376,9 @@ fn scan_data_dir(
     }
 
     let metadata = fs::metadata(current_dir)?;
-    let relative_path = current_dir.strip_prefix(data_dir).unwrap_or_else(|_| Path::new(""));
+    let relative_path = current_dir
+        .strip_prefix(data_dir)
+        .unwrap_or_else(|_| Path::new(""));
     let resource_path = webdav_path(relative_path);
 
     if metadata.is_dir() {
@@ -400,7 +402,8 @@ fn scan_data_dir(
         }
     } else if metadata.is_file() {
         if seen_paths.insert(resource_path.clone()) {
-            let (checksum, size) = file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
+            let (checksum, size) =
+                file_checksum_and_size(data_dir, &resource_path)?.unwrap_or_default();
             resources.push(ManifestEntry {
                 resource_path: resource_path.clone(),
                 resource_kind: "file".to_string(),
@@ -442,7 +445,11 @@ fn updated_at_for_path(path: &Path) -> String {
     }
 }
 
-fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> rusqlite::Result<()> {
+fn apply_event(
+    conn: &mut Connection,
+    data_dir: &Path,
+    event: EventEnvelope,
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     let source_path = normalize_path(&event.source_path);
     let destination_path = event.destination_path.as_deref().map(normalize_path);
@@ -468,13 +475,7 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
     match event.event_kind {
         EventKind::Deleted => {
             if let Some(row) = source_row.as_ref() {
-                archive_resource_id = Some(archive_resource(
-                    &tx,
-                    row,
-                    "delete",
-                    &event,
-                    None,
-                )?);
+                archive_resource_id = Some(archive_resource(&tx, row, "delete", &event, None)?);
                 tx.execute("DELETE FROM resources WHERE id = ?1", params![row.id])?;
                 checksum = row.checksum.clone();
             }
@@ -490,7 +491,10 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
                             &event,
                             None,
                         )?);
-                        tx.execute("DELETE FROM resources WHERE id = ?1", params![destination_row.id])?;
+                        tx.execute(
+                            "DELETE FROM resources WHERE id = ?1",
+                            params![destination_row.id],
+                        )?;
                     }
                 }
             }
@@ -524,7 +528,13 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
                     ],
                 )?;
             } else {
-                insert_or_replace_resource(&tx, &final_path, resource_kind, checksum.clone(), &event)?;
+                insert_or_replace_resource(
+                    &tx,
+                    &final_path,
+                    resource_kind,
+                    checksum.clone(),
+                    &event,
+                )?;
             }
         }
         EventKind::Copied => {
@@ -537,7 +547,10 @@ fn apply_event(conn: &mut Connection, data_dir: &Path, event: EventEnvelope) -> 
                         &event,
                         None,
                     )?);
-                    tx.execute("DELETE FROM resources WHERE id = ?1", params![destination_row.id])?;
+                    tx.execute(
+                        "DELETE FROM resources WHERE id = ?1",
+                        params![destination_row.id],
+                    )?;
                 }
             }
 

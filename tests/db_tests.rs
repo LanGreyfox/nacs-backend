@@ -17,7 +17,10 @@ fn temp_dir(name: &str) -> PathBuf {
         .as_nanos();
 
     let mut path = std::env::temp_dir();
-    path.push(format!("nacs-backend-{name}-{nanos}-{}", std::process::id()));
+    path.push(format!(
+        "nacs-backend-{name}-{nanos}-{}",
+        std::process::id()
+    ));
     path
 }
 
@@ -88,7 +91,8 @@ async fn record_created_event_persists_resource_and_event() {
 
     fs::create_dir_all(&base_dir).expect("temp dir should exist");
     let mut file = fs::File::create(&file_path).expect("test file should be created");
-    file.write_all(content).expect("test file should be writable");
+    file.write_all(content)
+        .expect("test file should be writable");
 
     let database = open_database(&base_dir, &base_dir).await;
     database.record(EventEnvelope {
@@ -202,7 +206,9 @@ async fn record_deleted_event_archives_resource_and_removes_active_row() {
             .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
             .expect("should query resource count");
         let archive_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM resource_archive", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM resource_archive", [], |row| {
+                row.get(0)
+            })
             .expect("should query archive count");
         let event_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
@@ -233,8 +239,10 @@ async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
     let content = b"checksum test content";
 
     fs::create_dir_all(&data_dir).expect("data dir should be created");
-    let mut file = fs::File::create(data_dir.join("report.txt")).expect("test file should be created");
-    file.write_all(content).expect("test file should be writable");
+    let mut file =
+        fs::File::create(data_dir.join("report.txt")).expect("test file should be created");
+    file.write_all(content)
+        .expect("test file should be writable");
 
     let database = open_database(&sqlite_dir, &data_dir).await;
     database.record(EventEnvelope {
@@ -337,15 +345,28 @@ async fn manifest_includes_existing_files_and_directories_without_prior_events()
 
     fs::create_dir_all(&data_dir).expect("data dir should be created");
     fs::create_dir_all(&data_dir.join("docs")).expect("docs dir should be created");
-    fs::write(data_dir.join("docs/readme.txt"), b"hello from disk").expect("test file should be created");
+    fs::write(data_dir.join("docs/readme.txt"), b"hello from disk")
+        .expect("test file should be created");
 
     let database = open_database(&sqlite_dir, &data_dir).await;
-    let manifest = database.manifest().await.expect("manifest should be readable");
+    let manifest = database
+        .manifest()
+        .await
+        .expect("manifest should be readable");
 
-    let paths: Vec<_> = manifest.resources.iter().map(|entry| entry.resource_path.clone()).collect();
+    let paths: Vec<_> = manifest
+        .resources
+        .iter()
+        .map(|entry| entry.resource_path.clone())
+        .collect();
     assert!(paths.contains(&"/docs".to_string()));
     assert!(paths.contains(&"/docs/readme.txt".to_string()));
-    assert!(manifest.resources.iter().any(|entry| entry.resource_kind == "file"));
+    assert!(
+        manifest
+            .resources
+            .iter()
+            .any(|entry| entry.resource_kind == "file")
+    );
 
     fs::remove_dir_all(&base_dir).expect("temp dir should be removed");
 }
@@ -411,15 +432,23 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
             .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
             .expect("should query resource count");
         let archive_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM resource_archive", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM resource_archive", [], |row| {
+                row.get(0)
+            })
             .expect("should query archive count");
         resource_count == 1 && archive_count == 1
     });
 
-    let manifest = database.manifest().await.expect("manifest should be readable");
+    let manifest = database
+        .manifest()
+        .await
+        .expect("manifest should be readable");
 
     assert!(
-        manifest.resources.iter().all(|entry| entry.resource_path != "/gone.txt"),
+        manifest
+            .resources
+            .iter()
+            .all(|entry| entry.resource_path != "/gone.txt"),
         "deleted resources should no longer appear as live manifest entries"
     );
     let entry = manifest
@@ -429,7 +458,10 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
         .expect("keep.txt should remain in the live manifest");
     assert_eq!(entry.resource_kind, "file");
     assert_eq!(entry.size, keep_content.len() as u64);
-    assert_eq!(entry.checksum.as_deref(), Some(sha256_hex(keep_content).as_str()));
+    assert_eq!(
+        entry.checksum.as_deref(),
+        Some(sha256_hex(keep_content).as_str())
+    );
 
     assert_eq!(manifest.tombstones.len(), 1);
     assert_eq!(manifest.tombstones[0].resource_path, "/gone.txt");
@@ -453,10 +485,16 @@ async fn manifest_scan_ignores_sync_temp_files() {
     .expect("nested tmp file should be written");
 
     let database = open_database(&sqlite_dir, &data_dir).await;
-    let manifest = database.manifest().await.expect("manifest should be readable");
+    let manifest = database
+        .manifest()
+        .await
+        .expect("manifest should be readable");
 
     assert!(
-        manifest.resources.iter().any(|entry| entry.resource_path == "/stable.txt"),
+        manifest
+            .resources
+            .iter()
+            .any(|entry| entry.resource_path == "/stable.txt"),
         "regular files should remain visible in the manifest"
     );
     assert!(

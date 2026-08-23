@@ -7,8 +7,8 @@ use std::{
 use libp2p::PeerId;
 use nacs_backend::db::{Database, EventKind, Manifest, ManifestEntry, TombstoneEntry};
 use nacs_backend::sync::{
-    self, diff_manifests, FileChangeEvent, FetchQueue, SyncAction, SyncRequest, SyncResponse,
-    SyncState,
+    self, FetchQueue, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
+    diff_manifests,
 };
 use sha2::{Digest, Sha256};
 
@@ -19,7 +19,10 @@ fn temp_dir(name: &str) -> PathBuf {
         .as_nanos();
 
     let mut path = std::env::temp_dir();
-    path.push(format!("nacs-backend-{name}-{nanos}-{}", std::process::id()));
+    path.push(format!(
+        "nacs-backend-{name}-{nanos}-{}",
+        std::process::id()
+    ));
     path
 }
 
@@ -97,7 +100,8 @@ fn sync_request_and_response_round_trip_through_serde() {
 
     for request in requests {
         let json = serde_json::to_string(&request).expect("request should serialize");
-        let _decoded: SyncRequest = serde_json::from_str(&json).expect("request should deserialize");
+        let _decoded: SyncRequest =
+            serde_json::from_str(&json).expect("request should deserialize");
     }
 
     let responses = vec![
@@ -404,7 +408,10 @@ async fn incoming_move_event_with_absolute_destination_url_renames_to_relative_t
         .await
         .expect("handling move event should succeed");
 
-    assert!(fetch_queue.is_empty().await, "local rename should not trigger a pull");
+    assert!(
+        fetch_queue.is_empty().await,
+        "local rename should not trigger a pull"
+    );
     assert!(
         !data_dir.join("old/file.txt").exists(),
         "source file should have been moved"
@@ -446,7 +453,10 @@ async fn incoming_copy_event_with_absolute_destination_url_copies_to_relative_ta
         .await
         .expect("handling copy event should succeed");
 
-    assert!(fetch_queue.is_empty().await, "local copy should not trigger a pull");
+    assert!(
+        fetch_queue.is_empty().await,
+        "local copy should not trigger a pull"
+    );
     assert_eq!(
         fs::read(data_dir.join("old/file.txt")).expect("source file should remain"),
         b"copy me"
@@ -492,7 +502,10 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
         .await
         .expect("handling the event should succeed");
 
-    let initial_request = fetch_queue.pop().await.expect("an initial FetchFile request should be queued");
+    let initial_request = fetch_queue
+        .pop()
+        .await
+        .expect("an initial FetchFile request should be queued");
     assert!(matches!(
         initial_request,
         SyncRequest::FetchFile { ref path, offset: 0 } if path == "/incoming.txt"
@@ -510,7 +523,10 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(follow_up.is_empty(), "single-chunk transfer should complete");
+    assert!(
+        follow_up.is_empty(),
+        "single-chunk transfer should complete"
+    );
     assert!(
         !state.is_pending(peer, "/incoming.txt"),
         "transfer should no longer be pending after completion"
@@ -797,7 +813,10 @@ async fn cancel_peer_removes_pending_transfer_and_temp_file() {
         .await
         .expect("chunk handling should succeed");
 
-    assert!(!follow_up.is_empty(), "transfer should still be pending after first chunk");
+    assert!(
+        !follow_up.is_empty(),
+        "transfer should still be pending after first chunk"
+    );
     assert!(state.is_pending(peer, "/disconnect.txt"));
     assert!(data_dir.join("disconnect.txt.p2p-tmp").exists());
 
@@ -952,7 +971,11 @@ async fn out_of_order_chunks_are_reassembled_in_offset_order() {
         state.is_pending(peer, "/ooo.txt"),
         "transfer must stay pending while early chunks are missing"
     );
-    assert!(follow_up.iter().all(|r| matches!(r, SyncRequest::FetchFile { .. })));
+    assert!(
+        follow_up
+            .iter()
+            .all(|r| matches!(r, SyncRequest::FetchFile { .. }))
+    );
 
     let middle_chunk = SyncResponse::Chunk {
         path: "/ooo.txt".to_string(),
@@ -977,7 +1000,10 @@ async fn out_of_order_chunks_are_reassembled_in_offset_order() {
         .await
         .expect("first chunk should complete the transfer");
 
-    assert!(follow_up.is_empty(), "transfer should complete once contiguous");
+    assert!(
+        follow_up.is_empty(),
+        "transfer should complete once contiguous"
+    );
     assert!(!state.is_pending(peer, "/ooo.txt"));
 
     let written = fs::read(data_dir.join("ooo.txt")).expect("file should have been written");

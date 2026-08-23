@@ -1,16 +1,23 @@
-use std::{convert::Infallible, io, net::SocketAddr, path::{Path, PathBuf}};
+use std::{
+    convert::Infallible,
+    io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
-use crate::db::{file_checksum_and_size, Database, EventEnvelope, EventKind};
+use crate::db::{Database, EventEnvelope, EventKind, file_checksum_and_size};
 use crate::sync::{FileChangeEvent, P2pHandle};
-use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
 use dav_server::body::Body;
-use hyper::{header::HeaderMap, server::conn::http1, service::service_fn, Method, Response, StatusCode, Uri};
+use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, USER_AGENT, WWW_AUTHENTICATE};
+use hyper::{
+    Method, Response, StatusCode, Uri, header::HeaderMap, server::conn::http1, service::service_fn,
+};
 // use dav_server::Body for response bodies (imported above)
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine as _;
 
 pub async fn ensure_data_dir(dir: impl AsRef<Path>) -> io::Result<()> {
     tokio::fs::create_dir_all(dir).await
@@ -257,20 +264,20 @@ pub fn log_file_event(
     user_agent: &str,
 ) {
     let tag = match event {
-        FileEvent::Created     => "FILE CREATED",
-        FileEvent::Edited      => "FILE EDITED",
-        FileEvent::Deleted     => "FILE DELETED",
-        FileEvent::Renamed     => "FILE RENAMED",
-        FileEvent::Moved       => "FILE MOVED",
-        FileEvent::Copied      => "FILE COPIED",
-        FileEvent::DirCreated  => "DIR CREATED",
+        FileEvent::Created => "FILE CREATED",
+        FileEvent::Edited => "FILE EDITED",
+        FileEvent::Deleted => "FILE DELETED",
+        FileEvent::Renamed => "FILE RENAMED",
+        FileEvent::Moved => "FILE MOVED",
+        FileEvent::Copied => "FILE COPIED",
+        FileEvent::DirCreated => "DIR CREATED",
         FileEvent::PropPatched => "PROPS PATCHED",
-        FileEvent::Locked      => "RESOURCE LOCKED",
-        FileEvent::Unlocked    => "RESOURCE UNLOCKED",
-        FileEvent::Read        => "FILE READ",
-        FileEvent::Listed      => "DIR LISTED",
-        FileEvent::Options     => "OPTIONS",
-        FileEvent::Unknown     => "UNKNOWN",
+        FileEvent::Locked => "RESOURCE LOCKED",
+        FileEvent::Unlocked => "RESOURCE UNLOCKED",
+        FileEvent::Read => "FILE READ",
+        FileEvent::Listed => "DIR LISTED",
+        FileEvent::Options => "OPTIONS",
+        FileEvent::Unknown => "UNKNOWN",
     };
 
     let line = format!("[{tag}] {method} {uri} -> {status} (ua={user_agent})");
@@ -509,5 +516,3 @@ pub async fn run_server(
         });
     }
 }
-
-

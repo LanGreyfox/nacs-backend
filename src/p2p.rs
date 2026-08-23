@@ -9,22 +9,21 @@ use std::{
 };
 
 use libp2p::{
-    core::{transport::PortUse, upgrade::DeniedUpgrade, Endpoint, Multiaddr},
+    PeerId, StreamProtocol, SwarmBuilder,
+    core::{Endpoint, Multiaddr, transport::PortUse, upgrade::DeniedUpgrade},
     futures::StreamExt,
-    identity,
-    mdns,
-    noise,
-    ping,
+    identity, mdns, noise, ping,
     request_response::{self, OutboundRequestId},
     swarm::{
+        ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent, ConnectionId,
+        StreamUpgradeError, SubstreamProtocol, SwarmEvent, THandler, THandlerInEvent,
+        THandlerOutEvent,
         behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
-        ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent,
-        ConnectionId, SwarmEvent,
-        THandler, THandlerInEvent, THandlerOutEvent,
-        handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-        StreamUpgradeError, SubstreamProtocol,
+        handler::{
+            ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
+        },
     },
-    tcp, yamux, PeerId, StreamProtocol, SwarmBuilder,
+    tcp, yamux,
 };
 use tokio::sync::mpsc;
 
@@ -127,7 +126,9 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
     fn poll(
         &mut self,
         _: &mut Context<'_>,
-    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>> {
+    ) -> Poll<
+        ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
+    > {
         Poll::Pending
     }
 
@@ -136,12 +137,12 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
         event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol>,
     ) {
         match event {
-            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound { protocol, .. }) => {
-                libp2p::core::util::unreachable(protocol)
-            }
-            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound { protocol, .. }) => {
-                libp2p::core::util::unreachable(protocol)
-            }
+            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
+                protocol, ..
+            }) => libp2p::core::util::unreachable(protocol),
+            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
+                protocol, ..
+            }) => libp2p::core::util::unreachable(protocol),
             ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => match error {
                 StreamUpgradeError::Timeout => unreachable!(),
                 StreamUpgradeError::Apply(e) => libp2p::core::util::unreachable(e),
@@ -226,7 +227,8 @@ pub async fn run_discovery(
     let mut sync_state = SyncState::new();
     let fetch_queue = sync::FetchQueue::new();
     let mut chunk_reader = sync::ChunkReader::new();
-    let mut pending_fetches: HashMap<OutboundRequestId, (PeerId, String, u64, u32)> = HashMap::new();
+    let mut pending_fetches: HashMap<OutboundRequestId, (PeerId, String, u64, u32)> =
+        HashMap::new();
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

@@ -8,8 +8,8 @@ use hyper::{Method, StatusCode};
 use nacs_backend::db::{Database, EventKind};
 use nacs_backend::sync::P2pHandle;
 use nacs_backend::webdav::{
-    build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials,
-    spawn_p2p_announcement, FileEvent,
+    FileEvent, build_unauthorized_response, ensure_data_dir, map_to_event, parse_basic_credentials,
+    spawn_p2p_announcement,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -19,7 +19,10 @@ fn temp_dir(name: &str) -> PathBuf {
         .as_nanos();
 
     let mut path = std::env::temp_dir();
-    path.push(format!("nacs-backend-{name}-{nanos}-{}", std::process::id()));
+    path.push(format!(
+        "nacs-backend-{name}-{nanos}-{}",
+        std::process::id()
+    ));
     path
 }
 
@@ -82,7 +85,12 @@ fn map_to_event_put_201_is_created() {
 #[test]
 fn map_to_event_put_204_is_edited() {
     assert_eq!(
-        map_to_event(&Method::PUT, StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        map_to_event(
+            &Method::PUT,
+            StatusCode::NO_CONTENT,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::Edited
     );
 }
@@ -90,7 +98,12 @@ fn map_to_event_put_204_is_edited() {
 #[test]
 fn map_to_event_delete_204_is_deleted() {
     assert_eq!(
-        map_to_event(&Method::DELETE, StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        map_to_event(
+            &Method::DELETE,
+            StatusCode::NO_CONTENT,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::Deleted
     );
 }
@@ -137,7 +150,12 @@ fn map_to_event_move_different_dir_is_moved() {
 #[test]
 fn map_to_event_move_no_destination_is_moved() {
     assert_eq!(
-        map_to_event(&method("MOVE"), StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        map_to_event(
+            &method("MOVE"),
+            StatusCode::NO_CONTENT,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::Moved
     );
 }
@@ -145,7 +163,12 @@ fn map_to_event_move_no_destination_is_moved() {
 #[test]
 fn map_to_event_copy_201_is_copied() {
     assert_eq!(
-        map_to_event(&method("COPY"), StatusCode::CREATED, &uri("/file.txt"), None),
+        map_to_event(
+            &method("COPY"),
+            StatusCode::CREATED,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::Copied
     );
 }
@@ -161,7 +184,12 @@ fn map_to_event_mkcol_201_is_dir_created() {
 #[test]
 fn map_to_event_propfind_207_is_listed() {
     assert_eq!(
-        map_to_event(&method("PROPFIND"), StatusCode::MULTI_STATUS, &uri("/"), None),
+        map_to_event(
+            &method("PROPFIND"),
+            StatusCode::MULTI_STATUS,
+            &uri("/"),
+            None
+        ),
         FileEvent::Listed
     );
 }
@@ -169,7 +197,12 @@ fn map_to_event_propfind_207_is_listed() {
 #[test]
 fn map_to_event_proppatch_207_is_prop_patched() {
     assert_eq!(
-        map_to_event(&method("PROPPATCH"), StatusCode::MULTI_STATUS, &uri("/file.txt"), None),
+        map_to_event(
+            &method("PROPPATCH"),
+            StatusCode::MULTI_STATUS,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::PropPatched
     );
 }
@@ -193,7 +226,12 @@ fn map_to_event_lock_200_is_locked() {
 #[test]
 fn map_to_event_unlock_204_is_unlocked() {
     assert_eq!(
-        map_to_event(&method("UNLOCK"), StatusCode::NO_CONTENT, &uri("/file.txt"), None),
+        map_to_event(
+            &method("UNLOCK"),
+            StatusCode::NO_CONTENT,
+            &uri("/file.txt"),
+            None
+        ),
         FileEvent::Unlocked
     );
 }
@@ -241,10 +279,7 @@ fn unauthorized_options_response_includes_dav_capability_headers() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        response
-            .headers()
-            .get("DAV")
-            .and_then(|v| v.to_str().ok()),
+        response.headers().get("DAV").and_then(|v| v.to_str().ok()),
         Some("1,2")
     );
     assert_eq!(
@@ -259,7 +294,9 @@ fn unauthorized_options_response_includes_dav_capability_headers() {
             .headers()
             .get("Allow")
             .and_then(|v| v.to_str().ok()),
-        Some("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK")
+        Some(
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
+        )
     );
 }
 
@@ -268,8 +305,7 @@ async fn spawn_p2p_announcement_computes_checksum_in_background() {
     let data_dir = temp_dir("spawn-p2p-announcement");
     let sqlite_dir = temp_dir("spawn-p2p-announcement-sqlite");
     fs::create_dir_all(&data_dir).expect("temp dir should be created");
-    fs::write(data_dir.join("report.txt"), b"hello webdav")
-        .expect("test file should be written");
+    fs::write(data_dir.join("report.txt"), b"hello webdav").expect("test file should be written");
     let database = Database::open(&sqlite_dir, &data_dir)
         .await
         .expect("database should open");
