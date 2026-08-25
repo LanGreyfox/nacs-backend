@@ -4,13 +4,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crc32fast::Hasher;
 use libp2p::PeerId;
 use nacs_backend::db::{Database, EventKind, Manifest, ManifestEntry, TombstoneEntry};
 use nacs_backend::sync::{
     self, FetchQueue, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
     diff_manifests,
 };
-use crc32fast::Hasher;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()

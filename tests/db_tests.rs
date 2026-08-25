@@ -6,9 +6,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crc32fast::Hasher;
 use nacs_backend::db::{Database, EventEnvelope, EventKind};
 use rusqlite::Connection;
-use crc32fast::Hasher;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()

@@ -18,8 +18,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use libp2p::PeerId;
 use crc32fast::Hasher;
+use libp2p::PeerId;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, mpsc},
