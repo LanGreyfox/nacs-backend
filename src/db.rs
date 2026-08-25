@@ -8,7 +8,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
+use crc32fast::Hasher;
 use tokio::sync::{mpsc, oneshot};
 
 const DB_FILENAME: &str = "webdav.db";
@@ -200,7 +200,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             current_folder TEXT NOT NULL,
             resource_kind TEXT NOT NULL CHECK (resource_kind IN ('file', 'folder')),
             checksum TEXT NULL,
-            checksum_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            checksum_algorithm TEXT NOT NULL DEFAULT 'crc32',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_event_type TEXT NOT NULL,
@@ -215,7 +215,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             current_folder TEXT NOT NULL,
             resource_kind TEXT NOT NULL CHECK (resource_kind IN ('file', 'folder')),
             checksum TEXT NULL,
-            checksum_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            checksum_algorithm TEXT NOT NULL DEFAULT 'crc32',
             archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             archived_reason TEXT NOT NULL CHECK (archived_reason IN ('delete', 'move', 'copy_replace')),
             deleted_by_event_type TEXT NOT NULL,
@@ -235,7 +235,7 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
             current_folder TEXT NOT NULL,
             resource_kind TEXT NOT NULL CHECK (resource_kind IN ('file', 'folder')),
             checksum TEXT NULL,
-            checksum_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            checksum_algorithm TEXT NOT NULL DEFAULT 'crc32',
             method TEXT NOT NULL,
             status_code INTEGER NOT NULL,
             username TEXT NULL,
@@ -504,7 +504,7 @@ fn apply_event(
                         current_folder = ?2,
                         resource_kind = ?3,
                         checksum = ?4,
-                        checksum_algorithm = 'sha256',
+                        checksum_algorithm = 'crc32',
                         updated_at = CURRENT_TIMESTAMP,
                         last_event_type = ?5,
                         last_method = ?6,
@@ -581,7 +581,7 @@ fn apply_event(
             username,
             source_resource_id,
             archive_resource_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sha256', ?7, ?8, ?9, ?10, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'crc32', ?7, ?8, ?9, ?10, ?11)
         "#,
         params![
             event.event_kind.as_str(),
@@ -622,7 +622,7 @@ fn insert_or_replace_resource(
             last_method,
             last_status_code,
             username
-        ) VALUES (?1, ?2, ?3, ?4, 'sha256', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?5, ?6, ?7, ?8)
+        ) VALUES (?1, ?2, ?3, ?4, 'crc32', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?5, ?6, ?7, ?8)
         ON CONFLICT(resource_path) DO UPDATE SET
             current_folder = excluded.current_folder,
             resource_kind = excluded.resource_kind,
@@ -742,7 +742,7 @@ fn compute_checksum(data_dir: &Path, webdav_path: &str) -> io::Result<Option<Str
     Ok(file_checksum_and_size(data_dir, webdav_path)?.map(|(checksum, _size)| checksum))
 }
 
-/// Computes the SHA-256 checksum and byte size of a resource on disk. Shared
+/// Computes the CRC32 checksum and byte size of a resource on disk. Shared
 /// by the local event-recording path and the WebDAV layer, which needs the
 /// same values to announce changes to p2p peers.
 pub(crate) fn file_checksum_and_size(
@@ -753,7 +753,7 @@ pub(crate) fn file_checksum_and_size(
     let rel = decoded.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
     let mut file = fs::File::open(&fs_path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     let mut buffer = [0_u8; 8192];
     let mut size: u64 = 0;
 
@@ -766,7 +766,7 @@ pub(crate) fn file_checksum_and_size(
         size += read as u64;
     }
 
-    Ok(Some((format!("{:x}", hasher.finalize()), size)))
+    Ok(Some((format!("{:08x}", hasher.finalize()), size)))
 }
 
 fn normalize_path(path: &str) -> String {

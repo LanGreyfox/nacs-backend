@@ -10,7 +10,7 @@ use nacs_backend::sync::{
     self, FetchQueue, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
     diff_manifests,
 };
-use sha2::{Digest, Sha256};
+use crc32fast::Hasher;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -26,10 +26,10 @@ fn temp_dir(name: &str) -> PathBuf {
     path
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+fn crc32_hex(bytes: &[u8]) -> String {
+    let mut hasher = Hasher::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:08x}", hasher.finalize())
 }
 
 fn manifest_entry(path: &str, checksum: &str, updated_at: &str) -> ManifestEntry {
@@ -487,7 +487,7 @@ async fn incoming_created_event_pulls_and_finalizes_on_matching_checksum() {
     let fetch_queue = FetchQueue::new();
 
     let content = b"hello from a peer";
-    let checksum = sha256_hex(content);
+    let checksum = crc32_hex(content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -667,7 +667,7 @@ async fn multi_chunk_transfer_requests_next_offset_until_last_chunk() {
     let part_b = b"second-half".to_vec();
     let mut full_content = part_a.clone();
     full_content.extend_from_slice(&part_b);
-    let checksum = sha256_hex(&full_content);
+    let checksum = crc32_hex(&full_content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -786,7 +786,7 @@ async fn cancel_peer_removes_pending_transfer_and_temp_file() {
     let fetch_queue = FetchQueue::new();
 
     let content = b"partial transfer content";
-    let checksum = sha256_hex(content);
+    let checksum = crc32_hex(content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -853,7 +853,7 @@ async fn cancel_peer_aborts_multi_chunk_transfer_and_ignores_late_chunks() {
     let second_part = b"second-half".to_vec();
     let mut full_content = first_part.clone();
     full_content.extend_from_slice(&second_part);
-    let checksum = sha256_hex(&full_content);
+    let checksum = crc32_hex(&full_content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -941,7 +941,7 @@ async fn out_of_order_chunks_are_reassembled_in_offset_order() {
     let mut full_content = part_a.clone();
     full_content.extend_from_slice(&part_b);
     full_content.extend_from_slice(&part_c);
-    let checksum = sha256_hex(&full_content);
+    let checksum = crc32_hex(&full_content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
@@ -1031,7 +1031,7 @@ async fn retry_chunk_recovers_from_failed_request() {
     let fetch_queue = FetchQueue::new();
 
     let content = b"retry me";
-    let checksum = sha256_hex(content);
+    let checksum = crc32_hex(content);
 
     let event = FileChangeEvent {
         event_kind: EventKind::Created,
