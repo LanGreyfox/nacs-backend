@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use libp2p::{identity, PeerId};
+use libp2p::{PeerId, identity};
 use nacs_backend::p2p::{load_or_create_identity, newly_discovered_peers};
 
 fn temp_path(name: &str) -> PathBuf {
@@ -13,7 +13,10 @@ fn temp_path(name: &str) -> PathBuf {
         .expect("system time before unix epoch")
         .as_nanos();
 
-    std::env::temp_dir().join(format!("nacs-backend-{name}-{nanos}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "nacs-backend-{name}-{nanos}-{}",
+        std::process::id()
+    ))
 }
 
 #[tokio::test]

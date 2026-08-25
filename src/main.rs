@@ -35,4 +35,3 @@ async fn run() -> std::io::Result<()> {
 
     webdav::run_server(addr, dir, database, p2p_handle).await
 }
-

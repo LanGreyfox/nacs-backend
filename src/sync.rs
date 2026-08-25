@@ -13,8 +13,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    env,
-    io,
+    env, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -23,10 +22,22 @@ use libp2p::PeerId;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
 };
 
 use crate::db::{self, Database, EventEnvelope, EventKind};
+
+#[derive(Debug, Clone)]
+struct StartPullParams<'a> {
+    data_dir: &'a Path,
+    fetch_queue: &'a FetchQueue,
+    peer: PeerId,
+    resource_path: String,
+    expected_checksum: Option<String>,
+    event_kind: EventKind,
+    destination_path: Option<String>,
+    username: String,
+}
 
 /// Maximum number of bytes transferred per chunk request/response round trip.
 ///
@@ -53,9 +64,7 @@ pub fn configured_chunk_size() -> usize {
 
     *CHUNK_SIZE.get_or_init(|| {
         let chunk_size = resolve_chunk_size_from_env(env::var(SYNC_CHUNK_SIZE_ENV));
-        println!(
-            "sync: configured chunk size = {chunk_size} bytes ({SYNC_CHUNK_SIZE_ENV})"
-        );
+        println!("sync: configured chunk size = {chunk_size} bytes ({SYNC_CHUNK_SIZE_ENV})");
         chunk_size
     })
 }
@@ -174,7 +183,7 @@ pub enum SyncResponse {
 
 /// Handle used by the WebDAV layer to announce locally-originated changes to
 /// the p2p worker, which then broadcasts them to connected peers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct P2pHandle {
     tx: mpsc::UnboundedSender<FileChangeEvent>,
 }
@@ -212,6 +221,7 @@ pub enum SyncAction {
 /// `apply_manifest_actions`) cannot push requests themselves, so the requests
 /// are collected here and drained by the caller in `p2p.rs`, which sends them
 /// to the peer (one per iteration of the swarm loop).
+#[derive(Debug)]
 pub struct FetchQueue {
     inner: Arc<Mutex<Vec<SyncRequest>>>,
 }
@@ -358,14 +368,12 @@ pub fn diff_manifests(local: &db::Manifest, remote: &db::Manifest) -> Vec<SyncAc
                 },
             )),
         ) = (remote_state, local_state)
+            && remote_kind == "file"
+            && local_kind == "file"
+            && remote_checksum.is_some()
+            && remote_checksum == local_checksum
         {
-            if remote_kind == "file"
-                && local_kind == "file"
-                && remote_checksum.is_some()
-                && remote_checksum == local_checksum
-            {
-                continue;
-            }
+            continue;
         }
 
         let is_remote_newer = match local_state {
@@ -523,11 +531,7 @@ impl SyncState {
 
     /// Resets the request window for a stalled transfer, re-requesting from
     /// the current write offset. Returns the new fetch requests.
-    pub async fn restart_stalled(
-        &mut self,
-        peer: PeerId,
-        path: &str,
-    ) -> Vec<SyncRequest> {
+    pub async fn restart_stalled(&mut self, peer: PeerId, path: &str) -> Vec<SyncRequest> {
         let Some(transfer) = self.pending.get_mut(&(peer, path.to_string())) else {
             return Vec::new();
         };
@@ -542,10 +546,10 @@ impl SyncState {
         let chunk_size = configured_chunk_size() as u64;
         while transfer.in_flight < window {
             let offset = transfer.next_request_offset;
-            if let Some(total) = transfer.total_size {
-                if offset >= total {
-                    break;
-                }
+            if let Some(total) = transfer.total_size
+                && offset >= total
+            {
+                break;
             }
             requests.push(SyncRequest::FetchFile {
                 path: path.to_string(),
@@ -571,7 +575,9 @@ impl SyncState {
 
         let count = stale.len();
         for (peer, path) in stale {
-            eprintln!("sync: removing stale transfer for {path} from {peer} (no activity > {max_age:?})");
+            eprintln!(
+                "sync: removing stale transfer for {path} from {peer} (no activity > {max_age:?})"
+            );
             let _ = self.cancel(peer, &path).await;
         }
         count
@@ -590,25 +596,23 @@ impl SyncState {
     /// if given, otherwise to `resource_path` itself) from `peer`. No-op if a
     /// pull for the same (peer, path) is already in flight. The first fetch
     /// request is queued on `fetch_queue` for the caller to send.
-    async fn start_pull(
-        &mut self,
-        data_dir: &Path,
-        fetch_queue: &FetchQueue,
-        peer: PeerId,
-        resource_path: String,
-        expected_checksum: Option<String>,
-        event_kind: EventKind,
-        destination_path: Option<String>,
-        username: String,
-    ) -> io::Result<()> {
-        let key = (peer, resource_path.clone());
+    async fn start_pull(&mut self, params: StartPullParams<'_>) -> io::Result<()> {
+        let key = (params.peer, params.resource_path.clone());
         if self.pending.contains_key(&key) {
             return Ok(());
         }
 
-        let target_path = destination_path.as_deref().unwrap_or(&resource_path);
-        let final_path = fs_path_from_wire_path(data_dir, target_path);
-        println!("sync: start pull for {resource_path} from peer {peer} -> {}", final_path.display());
+        let target_path = params
+            .destination_path
+            .as_deref()
+            .unwrap_or(&params.resource_path);
+        let final_path = fs_path_from_wire_path(params.data_dir, target_path);
+        println!(
+            "sync: start pull for {} from peer {} -> {}",
+            params.resource_path,
+            params.peer,
+            final_path.display()
+        );
         if let Some(parent) = final_path.parent() {
             println!("sync: ensure parent directory {}", parent.display());
             tokio::fs::create_dir_all(parent).await?;
@@ -630,12 +634,12 @@ impl SyncState {
             PendingTransfer {
                 tmp_path,
                 final_path,
-                resource_path: resource_path.clone(),
+                resource_path: params.resource_path.clone(),
                 file,
-                expected_checksum,
-                event_kind,
-                destination_path,
-                username,
+                expected_checksum: params.expected_checksum,
+                event_kind: params.event_kind,
+                destination_path: params.destination_path,
+                username: params.username,
                 total_size: None,
                 next_request_offset: 0,
                 in_flight: 0,
@@ -647,9 +651,10 @@ impl SyncState {
             },
         );
 
-        fetch_queue
+        params
+            .fetch_queue
             .push(SyncRequest::FetchFile {
-                path: resource_path,
+                path: params.resource_path,
                 offset: 0,
             })
             .await;
@@ -690,7 +695,10 @@ impl SyncState {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&transfer.final_path, b"").await?;
-            println!("sync: finalized empty file {}", transfer.final_path.display());
+            println!(
+                "sync: finalized empty file {}",
+                transfer.final_path.display()
+            );
             return Ok(Vec::new());
         }
 
@@ -724,11 +732,7 @@ impl SyncState {
             };
             println!(
                 "sync: {} {:.1}% ({}/{} bytes, {} in-flight)",
-                transfer.resource_path,
-                pct,
-                transfer.write_offset,
-                total_size,
-                transfer.in_flight
+                transfer.resource_path, pct, transfer.write_offset, total_size, transfer.in_flight
             );
         }
 
@@ -742,16 +746,16 @@ impl SyncState {
 
         println!("sync: verify checksum for {}", transfer.resource_path);
         let actual_checksum = format!("{:x}", transfer.hasher.finalize());
-        if let Some(expected) = &transfer.expected_checksum {
-            if expected != &actual_checksum {
-                eprintln!(
-                    "sync: checksum mismatch for {} from peer {peer} (expected {expected}, got {actual_checksum}); discarding transfer",
-                    transfer.resource_path
-                );
-                println!("sync: remove temp file {}", transfer.tmp_path.display());
-                let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
-                return Ok(Vec::new());
-            }
+        if let Some(expected) = &transfer.expected_checksum
+            && expected != &actual_checksum
+        {
+            eprintln!(
+                "sync: checksum mismatch for {} from peer {peer} (expected {expected}, got {actual_checksum}); discarding transfer",
+                transfer.resource_path
+            );
+            println!("sync: remove temp file {}", transfer.tmp_path.display());
+            let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
+            return Ok(Vec::new());
         }
 
         println!(
@@ -819,7 +823,9 @@ pub struct ChunkReader {
 
 impl ChunkReader {
     pub fn new() -> Self {
-        Self { handles: Vec::new() }
+        Self {
+            handles: Vec::new(),
+        }
     }
 
     /// Reads one chunk of `path` at `offset` from `data_dir`. Never fails:
@@ -955,10 +961,7 @@ pub async fn handle_incoming_event(
     event: FileChangeEvent,
 ) -> io::Result<()> {
     let source_path = normalize_wire_path(&event.source_path);
-    let destination_path = event
-        .destination_path
-        .as_deref()
-        .map(normalize_wire_path);
+    let destination_path = event.destination_path.as_deref().map(normalize_wire_path);
 
     match event.event_kind {
         EventKind::Deleted => {
@@ -991,7 +994,9 @@ pub async fn handle_incoming_event(
             Ok(())
         }
         EventKind::Renamed | EventKind::Moved => {
-            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let dest = destination_path
+                .clone()
+                .unwrap_or_else(|| source_path.clone());
             let src_fs = fs_path_from_wire_path(data_dir, &source_path);
             let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
@@ -1015,24 +1020,30 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(())
             } else {
-                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
+                println!(
+                    "sync: missing source {}, start pull for {}",
+                    src_fs.display(),
+                    dest
+                );
                 state
-                    .start_pull(
+                    .start_pull(StartPullParams {
                         data_dir,
                         fetch_queue,
                         peer,
-                        dest.clone(),
-                        event.checksum,
-                        event.event_kind,
-                        None,
-                        event.username,
-                    )
+                        resource_path: dest.clone(),
+                        expected_checksum: event.checksum,
+                        event_kind: event.event_kind,
+                        destination_path: None,
+                        username: event.username,
+                    })
                     .await?;
                 Ok(())
             }
         }
         EventKind::Copied => {
-            let dest = destination_path.clone().unwrap_or_else(|| source_path.clone());
+            let dest = destination_path
+                .clone()
+                .unwrap_or_else(|| source_path.clone());
             let src_fs = fs_path_from_wire_path(data_dir, &source_path);
             let dest_fs = fs_path_from_wire_path(data_dir, &dest);
 
@@ -1056,18 +1067,22 @@ pub async fn handle_incoming_event(
             } else if state.is_pending(peer, &dest) {
                 Ok(())
             } else {
-                println!("sync: missing source {}, start pull for {}", src_fs.display(), dest);
+                println!(
+                    "sync: missing source {}, start pull for {}",
+                    src_fs.display(),
+                    dest
+                );
                 state
-                    .start_pull(
+                    .start_pull(StartPullParams {
                         data_dir,
                         fetch_queue,
                         peer,
-                        dest.clone(),
-                        event.checksum,
-                        EventKind::Copied,
-                        None,
-                        event.username,
-                    )
+                        resource_path: dest.clone(),
+                        expected_checksum: event.checksum,
+                        event_kind: EventKind::Copied,
+                        destination_path: None,
+                        username: event.username,
+                    })
                     .await?;
                 Ok(())
             }
@@ -1079,16 +1094,16 @@ pub async fn handle_incoming_event(
             } else {
                 println!("sync: start pull for incoming {}", path);
                 state
-                    .start_pull(
+                    .start_pull(StartPullParams {
                         data_dir,
                         fetch_queue,
                         peer,
-                        path.clone(),
-                        event.checksum,
-                        event.event_kind,
-                        None,
-                        event.username,
-                    )
+                        resource_path: path.clone(),
+                        expected_checksum: event.checksum,
+                        event_kind: event.event_kind,
+                        destination_path: None,
+                        username: event.username,
+                    })
                     .await?;
                 Ok(())
             }
@@ -1151,16 +1166,16 @@ pub async fn apply_manifest_actions(
                 }
                 println!("sync: start manifest pull for {}", path);
                 if let Err(err) = state
-                    .start_pull(
+                    .start_pull(StartPullParams {
                         data_dir,
                         fetch_queue,
                         peer,
-                        path.clone(),
-                        checksum,
-                        EventKind::Edited,
-                        None,
-                        username.clone(),
-                    )
+                        resource_path: path.clone(),
+                        expected_checksum: checksum,
+                        event_kind: EventKind::Edited,
+                        destination_path: None,
+                        username: username.clone(),
+                    })
                     .await
                 {
                     eprintln!("sync: failed to start pull for {path}: {err}");
@@ -1170,4 +1185,3 @@ pub async fn apply_manifest_actions(
         }
     }
 }
-
