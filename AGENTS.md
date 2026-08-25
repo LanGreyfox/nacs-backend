@@ -41,7 +41,7 @@
 | `hyper` | 1.10.1 | HTTP/Server layer |
 | `libp2p` | 0.56.0 | Peer-to-peer communication and discovery |
 | `rusqlite` | 0.40.1 | SQLite database support |
-| `sha2` | 0.10 | SHA-256 checksum calculation |
+| `crc32fast` | 1.4 | CRC32 checksum calculation (faster on ARM/Raspberry PI) |
 
 ---
 
@@ -59,7 +59,7 @@
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1 (wire format unchanged and backwards compatible)
-✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES (note: the libp2p CBOR codec limits responses to 10 MiB by default; larger chunks need a custom codec limit)
+✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with CRC32 checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES (note: the libp2p CBOR codec limits responses to 10 MiB by default; larger chunks need a custom codec limit)
 ✅ P2P Sync Pipelining: up to SYNC_WINDOW_REQUESTS chunk requests in flight per transfer (default 4); out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
