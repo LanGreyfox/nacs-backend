@@ -18,8 +18,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crc32fast::Hasher;
 use libp2p::PeerId;
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, mpsc},
@@ -438,7 +438,7 @@ struct PendingTransfer {
     /// Chunks that arrived ahead of their position, keyed by offset.
     buffered: BTreeMap<u64, Vec<u8>>,
     /// Rolling checksum over the bytes written so far.
-    hasher: Sha256,
+    hasher: Hasher,
     /// When the last chunk was received or a request was sent, for
     /// stalled-transfer detection.
     last_activity: std::time::Instant,
@@ -646,7 +646,7 @@ impl SyncState {
                 write_offset: 0,
                 last_log_offset: 0,
                 buffered: BTreeMap::new(),
-                hasher: Sha256::new(),
+                hasher: Hasher::new(),
                 last_activity: std::time::Instant::now(),
             },
         );
@@ -745,7 +745,7 @@ impl SyncState {
         drop(transfer.file);
 
         println!("sync: verify checksum for {}", transfer.resource_path);
-        let actual_checksum = format!("{:x}", transfer.hasher.finalize());
+        let actual_checksum = format!("{:08x}", transfer.hasher.finalize());
         if let Some(expected) = &transfer.expected_checksum
             && expected != &actual_checksum
         {

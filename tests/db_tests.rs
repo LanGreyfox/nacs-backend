@@ -6,9 +6,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crc32fast::Hasher;
 use nacs_backend::db::{Database, EventEnvelope, EventKind};
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -47,10 +47,10 @@ fn open_conn(path: &Path) -> Connection {
     Connection::open(path).expect("should open sqlite database")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+fn crc32_hex(bytes: &[u8]) -> String {
+    let mut hasher = Hasher::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:08x}", hasher.finalize())
 }
 
 async fn open_database(sqlite_dir: &Path, data_dir: &Path) -> Database {
@@ -105,7 +105,7 @@ async fn record_created_event_persists_resource_and_event() {
         username: "alice".to_string(),
     });
 
-    let expected_checksum = sha256_hex(content);
+    let expected_checksum = crc32_hex(content);
 
     wait_for_condition(Duration::from_secs(2), || {
         if !sqlite_path.exists() {
@@ -255,7 +255,7 @@ async fn checksum_is_computed_from_webdav_path_relative_to_data_dir() {
         username: "bob".to_string(),
     });
 
-    let expected_checksum = sha256_hex(content);
+    let expected_checksum = crc32_hex(content);
 
     wait_for_condition(Duration::from_secs(2), || {
         if !sqlite_path.exists() {
@@ -309,7 +309,7 @@ async fn checksum_is_computed_for_percent_encoded_webdav_path() {
         username: "bob".to_string(),
     });
 
-    let expected_checksum = sha256_hex(content);
+    let expected_checksum = crc32_hex(content);
 
     wait_for_condition(Duration::from_secs(2), || {
         if !sqlite_path.exists() {
@@ -460,7 +460,7 @@ async fn manifest_lists_live_resources_and_tombstones_for_deleted_ones() {
     assert_eq!(entry.size, keep_content.len() as u64);
     assert_eq!(
         entry.checksum.as_deref(),
-        Some(sha256_hex(keep_content).as_str())
+        Some(crc32_hex(keep_content).as_str())
     );
 
     assert_eq!(manifest.tombstones.len(), 1);
