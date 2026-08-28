@@ -2,7 +2,7 @@
 //!
 //! This module implements a simple serial synchronization protocol:
 //! - One file transfers at a time globally (no parallel transfers)
-//! - Files are transferred in their entirety (no chunking)
+//! - Files are streamed in chunks to avoid loading large files into memory
 //! - Manifest-based reconciliation decides what to pull/delete
 //! - Simple request/response over libp2p request-response
 
@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::db::{Database, EventEnvelope, EventKind, Manifest};
+
+/// Chunk size for streaming large files (4 MiB).
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// A lightweight, content-free description of a change that happened
 /// locally. Used both as the local channel message from the WebDAV layer to
@@ -36,8 +39,10 @@ pub struct FileChangeEvent {
 pub enum SyncRequest {
     /// Ask the peer for its full resource/tombstone manifest.
     Manifest,
-    /// Ask the peer for a complete file.
+    /// Ask the peer for a complete file (streamed in chunks).
     FetchFile { path: String },
+    /// Ask for a specific chunk of a file.
+    FetchFileChunk { path: String, offset: u64 },
     /// Notify the peer that a local change happened; carries no content.
     Event(FileChangeEvent),
 }
@@ -45,10 +50,18 @@ pub enum SyncRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncResponse {
     Manifest(Manifest),
-    File {
+    /// Start of a file transfer - contains total size and expected checksum.
+    FileStart {
+        path: String,
+        total_size: u64,
+        checksum: String,
+    },
+    /// A chunk of file data.
+    FileChunk {
         path: String,
         data: Vec<u8>,
-        checksum: String,
+        offset: u64,
+        is_last: bool,
     },
     NotFound {
         path: String,
@@ -100,11 +113,23 @@ struct QueuedPullParams {
     username: String,
 }
 
+/// State for an in-progress chunked file download.
+struct ActiveTransfer {
+    params: QueuedPullParams,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    expected_checksum: String,
+    total_size: u64,
+    hasher: Hasher,
+    next_chunk_offset: u64,
+    file: Option<tokio::fs::File>,
+}
+
 /// Simple sync state - tracks at most one active transfer and a FIFO queue.
 #[derive(Default)]
 pub struct SyncState {
-    /// Currently active transfer params - None if idle.
-    current_transfer: Option<QueuedPullParams>,
+    /// Currently active transfer - None if idle.
+    current_transfer: Option<ActiveTransfer>,
     /// FIFO queue of pulls waiting for the current transfer to finish.
     queued_pulls: VecDeque<QueuedPullParams>,
     /// Retry count for current transfer (reset on success or new transfer)
@@ -123,7 +148,7 @@ impl SyncState {
 
     /// Returns true if a pull for (peer, path) is either active or queued.
     pub fn is_pending(&self, peer: PeerId, path: &str) -> bool {
-        if self.current_transfer.as_ref().is_some_and(|p| p.peer == peer && p.resource_path == path) {
+        if self.current_transfer.as_ref().is_some_and(|p| p.params.peer == peer && p.params.resource_path == path) {
             return true;
         }
         self.queued_pulls.iter().any(|q| q.peer == peer && q.resource_path == path)
@@ -136,7 +161,12 @@ impl SyncState {
 
     /// Returns the event_kind and username for the current transfer, if any.
     pub fn current_transfer_info(&self) -> Option<(EventKind, String)> {
-        self.current_transfer.as_ref().map(|p| (p.event_kind, p.username.clone()))
+        self.current_transfer.as_ref().map(|p| (p.params.event_kind, p.params.username.clone()))
+    }
+
+    /// Returns the current transfer's resource path, if any.
+    pub fn current_transfer_path(&self) -> Option<String> {
+        self.current_transfer.as_ref().map(|p| p.params.resource_path.clone())
     }
 
     /// Starts a pull if idle, otherwise queues it.
@@ -156,14 +186,25 @@ impl SyncState {
         }
 
         if self.current_transfer.is_none() {
-            // Start immediately
+            // Start immediately - we'll set up the transfer when FileStart arrives
             let params = QueuedPullParams {
                 peer,
                 resource_path: resource_path.clone(),
                 event_kind,
                 username,
             };
-            self.current_transfer = Some(params);
+            // Store expected_checksum for later verification
+            // For now, we'll get it from FileStart
+            self.current_transfer = Some(ActiveTransfer {
+                params,
+                temp_path: PathBuf::new(),
+                final_path: PathBuf::new(),
+                expected_checksum: _expected_checksum.unwrap_or_default(),
+                total_size: 0,
+                hasher: Hasher::new(),
+                next_chunk_offset: 0,
+                file: None,
+            });
             self.current_retry = 0;
             println!(
                 "sync: start pull for {} from peer {}",
@@ -176,7 +217,7 @@ impl SyncState {
                 "sync: queue pull for {} from peer {} (waiting for {})",
                 resource_path,
                 peer,
-                self.current_transfer.as_ref().unwrap().resource_path
+                self.current_transfer.as_ref().unwrap().params.resource_path
             );
             self.queued_pulls.push_back(QueuedPullParams {
                 peer,
@@ -194,14 +235,17 @@ impl SyncState {
         let was_current = self
             .current_transfer
             .as_ref()
-            .is_some_and(|p| p.peer == peer && p.resource_path == path);
+            .is_some_and(|p| p.params.peer == peer && p.params.resource_path == path);
 
         if !was_current {
             // Might have been cancelled, check queue
             return None;
         }
 
-self.current_transfer = None;
+        // Clean up temp file if it exists
+        if let Some(transfer) = self.current_transfer.take() {
+            let _ = std::fs::remove_file(&transfer.temp_path);
+        }
 
         // Start next queued pull
         if let Some(next) = self.queued_pulls.pop_front() {
@@ -209,7 +253,16 @@ self.current_transfer = None;
                 "sync: starting next queued pull for {} from peer {}",
                 next.resource_path, next.peer
             );
-            self.current_transfer = Some(next.clone());
+            self.current_transfer = Some(ActiveTransfer {
+                params: next.clone(),
+                temp_path: PathBuf::new(),
+                final_path: PathBuf::new(),
+                expected_checksum: String::new(),
+                total_size: 0,
+                hasher: Hasher::new(),
+                next_chunk_offset: 0,
+                file: unsafe { std::mem::zeroed() },
+            });
             self.current_retry = 0;
             return Some(SyncRequest::FetchFile {
                 path: next.resource_path,
@@ -225,7 +278,10 @@ self.current_transfer = None;
         const MAX_RETRIES: u32 = 3;
         if self.current_retry >= MAX_RETRIES {
             eprintln!("sync: max retries ({MAX_RETRIES}) exceeded for current transfer, giving up");
-            self.current_transfer = None;
+            // Clean up temp file
+            if let Some(transfer) = self.current_transfer.take() {
+                let _ = std::fs::remove_file(&transfer.temp_path);
+            }
             self.current_retry = 0;
             // Start next queued pull
             if let Some(next) = self.queued_pulls.pop_front() {
@@ -233,7 +289,16 @@ self.current_transfer = None;
                     "sync: starting next queued pull for {} from peer {} (after retries exhausted)",
                     next.resource_path, next.peer
                 );
-                self.current_transfer = Some(next.clone());
+                self.current_transfer = Some(ActiveTransfer {
+                    params: next.clone(),
+                    temp_path: PathBuf::new(),
+                    final_path: PathBuf::new(),
+                    expected_checksum: String::new(),
+                    total_size: 0,
+                    hasher: Hasher::new(),
+                    next_chunk_offset: 0,
+                    file: unsafe { std::mem::zeroed() },
+                });
                 self.current_retry = 0;
                 return Some(SyncRequest::FetchFile {
                     path: next.resource_path,
@@ -244,12 +309,14 @@ self.current_transfer = None;
 
         self.current_retry += 1;
         if let Some(current) = &self.current_transfer {
+            // Clean up temp file from failed attempt
+            let _ = std::fs::remove_file(&current.temp_path);
             println!(
                 "sync: retrying transfer for {} from peer {} (attempt {}/{})",
-                current.resource_path, current.peer, self.current_retry, MAX_RETRIES
+                current.params.resource_path, current.params.peer, self.current_retry, MAX_RETRIES
             );
             Some(SyncRequest::FetchFile {
-                path: current.resource_path.clone(),
+                path: current.params.resource_path.clone(),
             })
         } else {
             None
@@ -261,13 +328,16 @@ self.current_transfer = None;
         let was_current = self
             .current_transfer
             .as_ref()
-            .is_some_and(|p| p.peer == peer);
+            .is_some_and(|p| p.params.peer == peer);
 
         // Remove from queue
         self.queued_pulls.retain(|q| q.peer != peer);
 
         if was_current {
-            self.current_transfer = None;
+            // Clean up temp file
+            if let Some(transfer) = self.current_transfer.take() {
+                let _ = std::fs::remove_file(&transfer.temp_path);
+            }
             self.current_retry = 0;
             // Start next queued pull (from any peer)
             if let Some(next) = self.queued_pulls.pop_front() {
@@ -275,7 +345,16 @@ self.current_transfer = None;
                     "sync: starting next queued pull for {} from peer {} (after cancel)",
                     next.resource_path, next.peer
                 );
-                self.current_transfer = Some(next.clone());
+                self.current_transfer = Some(ActiveTransfer {
+                    params: next.clone(),
+                    temp_path: PathBuf::new(),
+                    final_path: PathBuf::new(),
+                    expected_checksum: String::new(),
+                    total_size: 0,
+                    hasher: Hasher::new(),
+                    next_chunk_offset: 0,
+                    file: unsafe { std::mem::zeroed() },
+                });
                 self.current_retry = 0;
                 return Ok(Some(SyncRequest::FetchFile {
                     path: next.resource_path,
@@ -284,6 +363,126 @@ self.current_transfer = None;
         }
 
         Ok(None)
+    }
+
+    /// Handle FileStart response - initialize the chunked transfer.
+    /// Returns the first FetchFileChunk request to send.
+    pub fn handle_file_start(
+        &mut self,
+        data_dir: &Path,
+        path: String,
+        total_size: u64,
+        checksum: String,
+    ) -> io::Result<Option<SyncRequest>> {
+        let Some(transfer) = self.current_transfer.as_mut() else {
+            return Ok(None);
+        };
+
+        if transfer.params.resource_path != path {
+            return Ok(None);
+        }
+
+        let final_path = fs_path_from_wire_path(data_dir, &path);
+        let temp_path = final_path.with_extension("p2p-tmp");
+
+        // Create temp file
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+
+        // Convert to async file
+        let async_file = tokio::fs::File::from_std(file);
+
+        transfer.temp_path = temp_path;
+        transfer.final_path = final_path;
+        transfer.expected_checksum = checksum;
+        transfer.total_size = total_size;
+        transfer.hasher = Hasher::new();
+        transfer.next_chunk_offset = 0;
+        transfer.file = Some(async_file);
+
+        println!("sync: file start {} ({} bytes), requesting first chunk", path, total_size);
+
+        // Request first chunk
+        Ok(Some(SyncRequest::FetchFileChunk {
+            path: path.clone(),
+            offset: 0,
+        }))
+    }
+
+    /// Handle FileChunk response - write chunk to temp file.
+    /// Returns next FetchFileChunk request if more chunks needed, or None if complete.
+    pub async fn handle_file_chunk(
+        &mut self,
+        _data_dir: &Path,
+        database: &Database,
+        path: String,
+        data: Vec<u8>,
+        offset: u64,
+        is_last: bool,
+    ) -> io::Result<Option<SyncRequest>> {
+        let Some(transfer) = self.current_transfer.as_mut() else {
+            return Ok(None);
+        };
+
+        if transfer.params.resource_path != path {
+            return Ok(None);
+        }
+
+        // Write chunk to temp file
+        use tokio::io::AsyncWriteExt;
+        transfer.file.as_mut().unwrap().write_all(&data).await?;
+        transfer.hasher.update(&data);
+        transfer.next_chunk_offset = offset + data.len() as u64;
+
+        if is_last {
+            // Verify checksum (clone hasher since finalize takes ownership)
+            let actual_checksum = format!("{:08x}", transfer.hasher.clone().finalize());
+            if actual_checksum != transfer.expected_checksum {
+                eprintln!(
+                    "sync: checksum mismatch for {} (expected {}, got {}); retrying",
+                    path, transfer.expected_checksum, actual_checksum
+                );
+                let _ = transfer.file.as_mut().unwrap().shutdown().await;
+                let _ = std::fs::remove_file(&transfer.temp_path);
+                return Ok(self.retry_current());
+            }
+
+            // Move temp file to final location
+            transfer.file.as_mut().unwrap().shutdown().await?;
+
+            if let Some(parent) = transfer.final_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::rename(&transfer.temp_path, &transfer.final_path).await?;
+
+            println!("sync: finalized file {}", transfer.final_path.display());
+
+            // Record in database
+            database.record(EventEnvelope {
+                event_kind: transfer.params.event_kind,
+                source_path: path.clone(),
+                destination_path: None,
+                checksum: Some(actual_checksum),
+                method: "P2P".to_string(),
+                status_code: 200,
+                username: transfer.params.username.clone(),
+            });
+
+            // Move to next queued transfer
+            let peer = transfer.params.peer;
+            let path = transfer.params.resource_path.clone();
+            let next = self.finish_transfer(peer, &path);
+            Ok(next)
+        } else {
+            // Request next chunk
+            Ok(Some(SyncRequest::FetchFileChunk {
+                path: path.clone(),
+                offset: transfer.next_chunk_offset,
+            }))
+        }
     }
 }
 
@@ -441,14 +640,22 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
     }
 }
 
-/// Reads an entire file into memory and returns it with its checksum.
-async fn read_file_with_checksum(data_dir: &Path, path: &str) -> io::Result<(Vec<u8>, String)> {
+/// Computes CRC32 checksum of a file without loading it entirely into memory.
+async fn compute_checksum(data_dir: &Path, path: &str) -> io::Result<Option<String>> {
     let fs_path = fs_path_from_wire_path(data_dir, path);
-    let data = tokio::fs::read(&fs_path).await?;
+    let mut file = tokio::fs::File::open(&fs_path).await?;
     let mut hasher = Hasher::new();
-    hasher.update(&data);
-    let checksum = format!("{:08x}", hasher.finalize());
-    Ok((data, checksum))
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(Some(format!("{:08x}", hasher.finalize())))
 }
 
 /// Applies an inbound `SyncRequest::Event` push notification.
@@ -599,63 +806,35 @@ pub async fn handle_incoming_event(
     }
 }
 
-/// Handles a file response from a peer.
-/// Returns the next FetchFile request to send, if any.
-pub async fn handle_file_response(
+/// Handles a FileStart response - begins a chunked file transfer.
+/// Returns the first FetchFileChunk request to send.
+pub async fn handle_file_start(
+    data_dir: &Path,
+    _database: &Database,
+    state: &mut SyncState,
+    _peer: PeerId,
+    path: String,
+    total_size: u64,
+    checksum: String,
+) -> io::Result<Option<SyncRequest>> {
+    println!("sync: file start {} ({} bytes)", path, total_size);
+    state.handle_file_start(data_dir, path, total_size, checksum)
+}
+
+/// Handles a FileChunk response - writes chunk to temp file.
+/// Returns next FetchFileChunk request if more chunks needed, or next file request if complete.
+pub async fn handle_file_chunk(
     data_dir: &Path,
     database: &Database,
     state: &mut SyncState,
-    peer: PeerId,
+    _peer: PeerId,
     path: String,
     data: Vec<u8>,
-    checksum: String,
-    event_kind: EventKind,
-    username: String,
+    offset: u64,
+    is_last: bool,
 ) -> io::Result<Option<SyncRequest>> {
-    println!("sync: received file {} ({} bytes)", path, data.len());
-
-// Verify checksum
-    let mut hasher = Hasher::new();
-    hasher.update(&data);
-    let actual_checksum = format!("{:08x}", hasher.finalize());
-
-    if actual_checksum != checksum {
-        eprintln!(
-            "sync: checksum mismatch for {} from peer {} (expected {}, got {}); retrying",
-            path, peer, checksum, actual_checksum
-        );
-        return Ok(state.retry_current());
-    }
-
-    // Write file
-    let final_path = fs_path_from_wire_path(data_dir, &path);
-    if let Some(parent) = final_path.parent() {
-        if let Err(err) = tokio::fs::create_dir_all(parent).await {
-            eprintln!("sync: failed to create dir for {}: {}; retrying", path, err);
-            return Ok(state.retry_current());
-        }
-    }
-    if let Err(err) = tokio::fs::write(&final_path, &data).await {
-        eprintln!("sync: failed to write {}: {}; retrying", path, err);
-        return Ok(state.retry_current());
-    }
-
-    println!("sync: finalized file {}", final_path.display());
-
-    // Record in database
-    database.record(EventEnvelope {
-        event_kind,
-        source_path: path.clone(),
-        destination_path: None,
-        checksum: Some(actual_checksum),
-        method: "P2P".to_string(),
-        status_code: 200,
-        username,
-    });
-
-    // Move to next queued transfer
-    let next = state.finish_transfer(peer, &path);
-    Ok(next)
+    println!("sync: received chunk {} ({} bytes, offset {}, last={})", path, data.len(), offset, is_last);
+    state.handle_file_chunk(data_dir, database, path, data, offset, is_last).await
 }
 
 /// Handles NotFound response - peer doesn't have the file.
@@ -736,24 +915,105 @@ pub async fn apply_manifest_actions(
     fetch_requests
 }
 
-/// Handles the sender side: reads a complete file and sends it.
+/// Handles the sender side: returns file metadata (start).
 pub async fn handle_fetch_request(
     data_dir: &Path,
     path: &str,
 ) -> SyncResponse {
-    match read_file_with_checksum(data_dir, path).await {
-        Ok((data, checksum)) => {
-            println!("sync: sending file {} ({} bytes)", path, data.len());
-            SyncResponse::File {
+    let fs_path = fs_path_from_wire_path(data_dir, path);
+    let metadata = match tokio::fs::metadata(&fs_path).await {
+        Ok(m) => m,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound {
+                eprintln!("sync: failed to stat {path} for fetch request: {err}");
+            }
+            return SyncResponse::NotFound {
                 path: path.to_string(),
-                data,
-                checksum,
+            };
+        }
+    };
+    let total_size = metadata.len();
+
+    // Compute checksum
+    let checksum = match compute_checksum(data_dir, path).await {
+        Ok(Some(cs)) => cs,
+        Ok(None) => "empty".to_string(),
+        Err(err) => {
+            eprintln!("sync: failed to compute checksum for {path}: {err}");
+            return SyncResponse::NotFound {
+                path: path.to_string(),
+            };
+        }
+    };
+
+    println!("sync: file start {} ({} bytes)", path, total_size);
+    SyncResponse::FileStart {
+        path: path.to_string(),
+        total_size,
+        checksum,
+    }
+}
+
+/// Handles a chunk request from the receiver.
+pub async fn handle_fetch_chunk(
+    data_dir: &Path,
+    path: &str,
+    offset: u64,
+) -> SyncResponse {
+    let fs_path = fs_path_from_wire_path(data_dir, path);
+    let metadata = match tokio::fs::metadata(&fs_path).await {
+        Ok(m) => m,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound {
+                eprintln!("sync: failed to stat {path} for chunk request: {err}");
+            }
+            return SyncResponse::NotFound {
+                path: path.to_string(),
+            };
+        }
+    };
+    let total_size = metadata.len();
+
+    if offset >= total_size && total_size > 0 {
+        return SyncResponse::NotFound {
+            path: path.to_string(),
+        };
+    }
+
+    let mut file = match tokio::fs::File::open(&fs_path).await {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("sync: failed to open {path} for chunk request: {err}");
+            return SyncResponse::NotFound {
+                path: path.to_string(),
+            };
+        }
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        eprintln!("sync: failed to seek {path} for chunk request: {err}");
+        return SyncResponse::NotFound {
+            path: path.to_string(),
+        };
+    }
+
+    let remaining = total_size.saturating_sub(offset);
+    let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
+    let mut buffer = vec![0_u8; to_read];
+
+    match file.read_exact(&mut buffer).await {
+        Ok(_) => {
+            let new_offset = offset + buffer.len() as u64;
+            SyncResponse::FileChunk {
+                path: path.to_string(),
+                data: buffer,
+                offset,
+                is_last: new_offset >= total_size,
             }
         }
         Err(err) => {
-            if err.kind() != io::ErrorKind::NotFound {
-                eprintln!("sync: failed to read {path} for fetch request: {err}");
-            }
+            eprintln!("sync: failed to read chunk of {path} at offset {offset}: {err}");
             SyncResponse::NotFound {
                 path: path.to_string(),
             }

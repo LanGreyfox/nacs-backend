@@ -9,7 +9,7 @@ use libp2p::PeerId;
 use nacs_backend::db::{Database, EventKind, Manifest, ManifestEntry, TombstoneEntry};
 use nacs_backend::sync::{
     self, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
-    diff_manifests, handle_fetch_request, handle_file_response,
+    diff_manifests, handle_fetch_request, handle_file_start, handle_file_chunk,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -103,10 +103,16 @@ fn sync_request_and_response_round_trip_through_serde() {
 
     let responses = vec![
         SyncResponse::Manifest(Manifest::default()),
-        SyncResponse::File {
+        SyncResponse::FileStart {
+            path: "/a.txt".to_string(),
+            total_size: 4,
+            checksum: "abc123".to_string(),
+        },
+        SyncResponse::FileChunk {
             path: "/a.txt".to_string(),
             data: vec![1, 2, 3, 4],
-            checksum: "abc123".to_string(),
+            offset: 0,
+            is_last: true,
         },
         SyncResponse::NotFound {
             path: "/missing.txt".to_string(),
@@ -426,7 +432,7 @@ async fn incoming_copy_event_with_absolute_destination_url_copies_to_relative_ta
 // --- Simple file transfer tests ---
 
 #[tokio::test]
-async fn fetch_request_reads_entire_file() {
+async fn fetch_request_returns_file_start() {
     let data_dir = temp_dir("sync-fetch-data");
     fs::create_dir_all(&data_dir).expect("data dir should be created");
 
@@ -436,11 +442,11 @@ async fn fetch_request_reads_entire_file() {
     let response = handle_fetch_request(&data_dir, "/test.txt").await;
 
     match response {
-        SyncResponse::File { data, checksum, .. } => {
-            assert_eq!(data, content);
+        SyncResponse::FileStart { total_size, checksum, .. } => {
+            assert_eq!(total_size, content.len() as u64);
             assert_eq!(checksum, crc32_hex(content));
         }
-        other => panic!("expected file response, got {other:?}"),
+        other => panic!("expected FileStart response, got {other:?}"),
     }
 
     fs::remove_dir_all(&data_dir).ok();
@@ -464,7 +470,7 @@ async fn fetch_request_returns_not_found_for_missing_file() {
 }
 
 #[tokio::test]
-async fn handle_file_response_writes_file_and_verifies_checksum() {
+async fn handle_file_start_and_chunk_writes_file_and_verifies_checksum() {
     let sqlite_dir = temp_dir("sync-file-response-sqlite");
     let data_dir = temp_dir("sync-file-response-data");
     fs::create_dir_all(&data_dir).expect("data dir should be created");
@@ -490,20 +496,34 @@ async fn handle_file_response_writes_file_and_verifies_checksum() {
     );
     assert!(req.is_some());
 
-    // Handle the file response
-    handle_file_response(
+    // Handle FileStart response
+    let next = handle_file_start(
+        &data_dir,
+        &database,
+        &mut state,
+        peer,
+        "/incoming.txt".to_string(),
+        content.len() as u64,
+        checksum.clone(),
+    )
+    .await
+    .expect("file start handling should succeed");
+    assert!(next.is_some());
+
+    // Handle FileChunk response (single chunk, is_last=true)
+    let next = handle_file_chunk(
         &data_dir,
         &database,
         &mut state,
         peer,
         "/incoming.txt".to_string(),
         content.to_vec(),
-        checksum,
-        EventKind::Created,
-        "peer:test".to_string(),
+        0,
+        true,
     )
     .await
-    .expect("file response handling should succeed");
+    .expect("file chunk handling should succeed");
+    assert!(next.is_none()); // transfer complete, no more chunks
 
     let written = fs::read(data_dir.join("incoming.txt")).expect("file should have been written");
     assert_eq!(written, content);
@@ -514,7 +534,7 @@ async fn handle_file_response_writes_file_and_verifies_checksum() {
 }
 
 #[tokio::test]
-async fn handle_file_response_discards_on_checksum_mismatch() {
+async fn handle_file_chunk_discards_on_checksum_mismatch() {
     let sqlite_dir = temp_dir("sync-file-response-bad-sqlite");
     let data_dir = temp_dir("sync-file-response-bad-data");
     fs::create_dir_all(&data_dir).expect("data dir should be created");
@@ -527,48 +547,64 @@ async fn handle_file_response_discards_on_checksum_mismatch() {
     let mut state = SyncState::new();
 
     let content = b"tampered content";
+    let checksum = crc32_hex(content);
 
     // Start a pull with wrong expected checksum
     state.start_pull(
         &data_dir,
         peer,
         "/bad.txt".to_string(),
-        Some("expected-but-wrong-checksum".to_string()),
+        None, // expected_checksum is ignored, FileStart provides the authoritative checksum
         EventKind::Created,
         "peer:test".to_string(),
     );
 
-    // Handle the file response with mismatched checksum
-    handle_file_response(
+    // Handle FileStart response with WRONG checksum
+    let next = handle_file_start(
+        &data_dir,
+        &database,
+        &mut state,
+        peer,
+        "/bad.txt".to_string(),
+        content.len() as u64,
+        "wrong-checksum".to_string(), // Wrong checksum in FileStart
+    )
+    .await
+    .expect("file start handling should succeed");
+    assert!(next.is_some());
+
+    // Handle FileChunk response with correct content but wrong expected checksum
+    let next = handle_file_chunk(
         &data_dir,
         &database,
         &mut state,
         peer,
         "/bad.txt".to_string(),
         content.to_vec(),
-        "wrong-checksum".to_string(),
-        EventKind::Created,
-        "peer:test".to_string(),
+        0,
+        true,
     )
     .await
-    .expect("file response handling should not error even on mismatch");
+    .expect("file chunk handling should not error even on mismatch");
+    // Should retry - returns a FetchFileChunk request
+    assert!(next.is_some());
 
     // After checksum mismatch, it should retry (up to 3 times)
-    // First call retries, second call retries, third call retries, fourth call gives up
+    // Each call retries - after 3 retries it gives up
     for _ in 0..3 {
-        sync::handle_file_response(
+        let next = handle_file_chunk(
             &data_dir,
             &database,
             &mut state,
             peer,
             "/bad.txt".to_string(),
             content.to_vec(),
-            "wrong-checksum".to_string(),
-            EventKind::Created,
-            "peer:test".to_string(),
+            0,
+            true,
         )
         .await
-        .expect("file response handling should not error even on mismatch");
+        .expect("file chunk handling should not error even on mismatch");
+        // Each call should return a retry request
     }
 
     // After max retries, it should give up and not be busy
@@ -605,6 +641,19 @@ async fn handle_not_found_removes_pending_transfer() {
         "peer:test".to_string(),
     );
     assert!(state.is_busy());
+
+    // Handle FileStart response first
+    let _ = handle_file_start(
+        &data_dir,
+        &database,
+        &mut state,
+        peer,
+        "/missing.txt".to_string(),
+        100,
+        "checksum".to_string(),
+    )
+    .await
+    .expect("file start handling should succeed");
 
     // Handle NotFound response - should retry up to 3 times then give up
     for _ in 0..4 {

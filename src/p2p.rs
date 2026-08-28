@@ -27,7 +27,7 @@ use libp2p::{
 };
 use tokio::sync::mpsc;
 
-use crate::db::{Database, EventKind};
+use crate::db::Database;
 use crate::sync::{self, FileChangeEvent, SyncRequest, SyncResponse, SyncState};
 
 const KEY_FILENAME: &str = "p2p_identity.key";
@@ -300,6 +300,10 @@ pub async fn run_discovery(
                                 let response = sync::handle_fetch_request(&data_dir, &path).await;
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                             }
+                            SyncRequest::FetchFileChunk { path, offset } => {
+                                let response = sync::handle_fetch_chunk(&data_dir, &path, offset).await;
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                            }
                             SyncRequest::Event(event) => {
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Ack);
                                 match sync::handle_incoming_event(&data_dir, &database, &mut sync_state, peer, event).await {
@@ -331,24 +335,32 @@ pub async fn run_discovery(
                                 }
                                 Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
                             },
-                            SyncResponse::File { path, data, checksum } => {
-                                // Get event kind and username from the current transfer
-                                let (event_kind, username) = sync_state
-                                    .current_transfer_info()
-                                    .unwrap_or((EventKind::Edited, format!("p2p:{peer}")));
-
-                                if let Ok(Some(next_request)) = sync::handle_file_response(
+                            SyncResponse::FileStart { path, total_size, checksum } => {
+                                if let Ok(Some(next_request)) = sync::handle_file_start(
+                                    &data_dir,
+                                    &database,
+                                    &mut sync_state,
+                                    peer,
+                                    path,
+                                    total_size,
+                                    checksum,
+                                ).await {
+                                    // Send first chunk request
+                                    let _ = swarm.behaviour_mut().sync.send_request(&peer, next_request);
+                                }
+                            }
+                            SyncResponse::FileChunk { path, data, offset, is_last } => {
+                                if let Ok(Some(next_request)) = sync::handle_file_chunk(
                                     &data_dir,
                                     &database,
                                     &mut sync_state,
                                     peer,
                                     path,
                                     data,
-                                    checksum,
-                                    event_kind,
-                                    username,
+                                    offset,
+                                    is_last,
                                 ).await {
-                                    // Send next fetch request if queued
+                                    // Send next chunk request or next file request
                                     let _ = swarm.behaviour_mut().sync.send_request(&peer, next_request);
                                 }
                             }
