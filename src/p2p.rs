@@ -45,6 +45,7 @@ const MAX_FETCH_RETRIES: u32 = 5;
 // Stale transfers are aborted after 10 minutes without progress.
 const STALE_TRANSFER_TIMEOUT_SECS: u64 = 600;
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
+const SYNC_RESPONSE_CODEC_OVERHEAD_BYTES: u64 = 1024 * 1024;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
@@ -170,8 +171,13 @@ pub async fn run_discovery(
     let key_path = key_path(base_dir.as_ref(), listen_port);
     let local_key = load_or_create_identity(&key_path).await?;
     let local_peer_id = PeerId::from(local_key.public());
+    let sync_response_size_maximum = (sync::configured_chunk_size() as u64)
+        .saturating_add(SYNC_RESPONSE_CODEC_OVERHEAD_BYTES);
 
     println!("p2p node started: {local_peer_id}");
+    println!(
+        "sync: configured CBOR response limit = {sync_response_size_maximum} bytes"
+    );
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -191,7 +197,9 @@ pub async fn run_discovery(
                     .with_interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
                     .with_timeout(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)),
             );
-            let sync = request_response::cbor::Behaviour::new(
+            let sync = request_response::cbor::Behaviour::with_codec(
+                request_response::cbor::codec::Codec::<SyncRequest, SyncResponse>::default()
+                    .set_response_size_maximum(sync_response_size_maximum),
                 [(
                     StreamProtocol::new(SYNC_PROTOCOL),
                     request_response::ProtocolSupport::Full,

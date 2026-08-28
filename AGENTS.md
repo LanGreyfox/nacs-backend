@@ -59,7 +59,7 @@
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1 (wire format unchanged and backwards compatible)
-✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with CRC32 checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES (note: the libp2p CBOR codec limits responses to 10 MiB by default; larger chunks need a custom codec limit)
+✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with CRC32 checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES; the CBOR response limit is sized to the configured chunk plus 1 MiB protocol overhead
 ✅ P2P Sync Pipelining: up to SYNC_WINDOW_REQUESTS chunk requests in flight per transfer (default 4); out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size
 ✅ P2P Sync Serial Mode: optional serial execution via SYNC_SERIAL=1 (default 0); when enabled, only one file transfers at a time globally and window is forced to 1 (no pipelining)
 ✅ Swarm Idle Timeout: 60 seconds
@@ -140,7 +140,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
-- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 4194304 bytes (4 MiB); invalid values warn and fall back to default
+- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 4194304 bytes (4 MiB); invalid values warn and fall back to default. The CBOR response limit is configured as chunk size plus 1 MiB protocol overhead.
 - **Request window:** Configurable via `SYNC_WINDOW_REQUESTS`, defaults to 4 in-flight chunk requests per transfer; invalid values warn and fall back to default
 - **Serial mode:** Configurable via `SYNC_SERIAL` (1/true/yes/on), defaults to false; forces single global file transfer and window=1
 - **Request timeout:** 60 s per sync request; failed chunk requests are retried up to 3 times before the transfer is aborted

@@ -40,10 +40,6 @@ struct StartPullParams<'a> {
 }
 
 /// Maximum number of bytes transferred per chunk request/response round trip.
-///
-/// Note: the libp2p CBOR codec limits responses to 10 MiB by default, so
-/// values above ~10 MiB require raising the codec's response size limit via
-/// `Behaviour::with_codec(... .set_response_size_maximum(...))`.
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const SYNC_CHUNK_SIZE_ENV: &str = "SYNC_CHUNK_SIZE_BYTES";
 
