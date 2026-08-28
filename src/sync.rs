@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::db::{Database, EventEnvelope, EventKind, Manifest};
 
 /// Chunk size for streaming large files (4 MiB).
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB chunks for memory-constrained devices
 
 /// A lightweight, content-free description of a change that happened
 /// locally. Used both as the local channel message from the WebDAV layer to

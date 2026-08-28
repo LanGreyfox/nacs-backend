@@ -34,11 +34,11 @@ const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
-const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 60;
-const SYNC_REQUEST_TIMEOUT_SECS: u64 = 300;
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300; // 5 minutes to allow slow chunk transfers
+const SYNC_REQUEST_TIMEOUT_SECS: u64 = 1800; // 30 minutes for large file transfers
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
-// Response size limit: allow large files (100 MB default, can be adjusted if needed)
-const SYNC_RESPONSE_SIZE_MAXIMUM: u64 = 100 * 1024 * 1024;
+// Response size limit: allow large files (200 MB for chunked transfers)
+const SYNC_RESPONSE_SIZE_MAXIMUM: u64 = 200 * 1024 * 1024;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct DiscoveryBehaviour {
