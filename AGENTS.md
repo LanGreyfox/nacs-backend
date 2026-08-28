@@ -59,9 +59,7 @@
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1 (wire format unchanged and backwards compatible)
-✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with CRC32 checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES; the CBOR response limit is sized to the configured chunk plus 1 MiB protocol overhead
-✅ P2P Sync Pipelining: up to SYNC_WINDOW_REQUESTS chunk requests in flight per transfer (default 4); out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size
-✅ P2P Sync Serial Mode: optional serial execution via SYNC_SERIAL=1 (default 0); when enabled, only one file transfers at a time globally and window is forced to 1 (no pipelining)
+✅ P2P Sync: Simple serial file transfers - one file at a time globally, whole file transferred in single request/response; CRC32 checksum verification
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
@@ -140,10 +138,8 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
-- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 4194304 bytes (4 MiB); invalid values warn and fall back to default. The CBOR response limit is configured as chunk size plus 1 MiB protocol overhead.
-- **Request window:** Configurable via `SYNC_WINDOW_REQUESTS`, defaults to 4 in-flight chunk requests per transfer; invalid values warn and fall back to default
-- **Serial mode:** Configurable via `SYNC_SERIAL` (1/true/yes/on), defaults to false; forces single global file transfer and window=1
-- **Request timeout:** 60 s per sync request; failed chunk requests are retried up to 3 times before the transfer is aborted
+- **Sync mode:** Simple serial - one file at a time globally, whole file transferred in single request/response; CRC32 checksum verification
+- **Request timeout:** 300 s per sync request (5 minutes for large files)
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
 - **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
@@ -162,9 +158,6 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | **Sync tests** | `cargo test --test sync_tests` |
 | **All tests** | `cargo test --all` |
 | **Set P2P Port** | `P2P_PORT=5001 cargo run` |
-| **Set sync chunk size** | `SYNC_CHUNK_SIZE_BYTES=8388608 cargo run` |
-| **Set sync window** | `SYNC_WINDOW_REQUESTS=8 cargo run` |
-| **Enable serial sync** | `SYNC_SERIAL=1 cargo run` |
 
 ---
 
@@ -180,9 +173,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-08-26 (serial sync mode: SYNC_SERIAL=1 forces single global file transfer, window=1, FIFO queue; chunk size remains configurable) |
+| **Last Updated** | 2026-08-28 (simplified serial sync: whole file transfers, no chunking/pipelining, single global transfer queue) |
 | **Status** | ✅ Active project info for future interactions |
-| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
+| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and simple serial file sync implemented |
 
 ---
 
