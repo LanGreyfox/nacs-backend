@@ -12,7 +12,7 @@
 //! bounded to one chunk regardless of file size.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     env, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -51,6 +51,10 @@ const SYNC_CHUNK_SIZE_ENV: &str = "SYNC_CHUNK_SIZE_BYTES";
 pub const DEFAULT_WINDOW_REQUESTS: usize = 4;
 const SYNC_WINDOW_REQUESTS_ENV: &str = "SYNC_WINDOW_REQUESTS";
 
+/// Enable serial sync mode: only one file transfer at a time globally,
+/// and one chunk at a time per transfer (window = 1).
+const SYNC_SERIAL_ENV: &str = "SYNC_SERIAL";
+
 /// Number of file handles cached on the sending side to avoid re-opening the
 /// same file for every chunk request.
 const CHUNK_READER_CACHE_CAPACITY: usize = 8;
@@ -83,6 +87,30 @@ pub fn configured_window_requests() -> usize {
             "sync: configured window = {window} in-flight requests ({SYNC_WINDOW_REQUESTS_ENV})"
         );
         window
+    })
+}
+
+/// Returns whether serial sync mode is enabled.
+///
+/// In serial mode, only one file transfer happens at a time globally,
+/// and the request window is forced to 1 (no pipelining).
+/// Resolved once from `SYNC_SERIAL` at startup and cached.
+pub fn configured_serial_mode() -> bool {
+    static SERIAL_MODE: OnceLock<bool> = OnceLock::new();
+
+    *SERIAL_MODE.get_or_init(|| {
+        let serial = match env::var(SYNC_SERIAL_ENV) {
+            Ok(value) => matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+            Err(env::VarError::NotPresent) => false,
+            Err(err) => {
+                eprintln!(
+                    "sync: unable to read {SYNC_SERIAL_ENV} ({err}); defaulting to false"
+                );
+                false
+            }
+        };
+        println!("sync: serial mode = {serial} ({SYNC_SERIAL_ENV})");
+        serial
     })
 }
 
@@ -138,6 +166,20 @@ pub fn resolve_chunk_size_from_env(raw: Result<String, env::VarError>) -> usize 
                 "sync: unable to read {SYNC_CHUNK_SIZE_ENV} ({err}); using default {DEFAULT_CHUNK_SIZE} bytes"
             );
             DEFAULT_CHUNK_SIZE
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn resolve_serial_mode_from_env(raw: Result<String, env::VarError>) -> bool {
+    match raw {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+        Err(env::VarError::NotPresent) => false,
+        Err(err) => {
+            eprintln!(
+                "sync: unable to read {SYNC_SERIAL_ENV} ({err}); defaulting to false"
+            );
+            false
         }
     }
 }
@@ -221,7 +263,7 @@ pub enum SyncAction {
 /// `apply_manifest_actions`) cannot push requests themselves, so the requests
 /// are collected here and drained by the caller in `p2p.rs`, which sends them
 /// to the peer (one per iteration of the swarm loop).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FetchQueue {
     inner: Arc<Mutex<Vec<SyncRequest>>>,
 }
@@ -250,6 +292,20 @@ impl Default for FetchQueue {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parameters for a queued pull operation, stored when serial mode is active
+/// and another transfer is already in progress.
+#[derive(Debug, Clone)]
+struct QueuedPullParams {
+    data_dir: PathBuf,
+    fetch_queue: FetchQueue,
+    peer: PeerId,
+    resource_path: String,
+    expected_checksum: Option<String>,
+    event_kind: EventKind,
+    destination_path: Option<String>,
+    username: String,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +505,10 @@ struct PendingTransfer {
 #[derive(Default)]
 pub struct SyncState {
     pending: HashMap<(PeerId, String), PendingTransfer>,
+    /// Serial mode: currently active transfer (peer, path).
+    current_transfer: Option<(PeerId, String)>,
+    /// Serial mode: FIFO queue of pulls waiting for the current transfer to finish.
+    queued_pulls: VecDeque<QueuedPullParams>,
 }
 
 impl SyncState {
@@ -470,8 +530,33 @@ impl SyncState {
             .map(|(_, path)| path.clone())
             .collect();
 
+        let was_current = configured_serial_mode()
+            && self.current_transfer.as_ref().is_some_and(|(p, _)| *p == peer);
+
         for path in paths {
             self.cancel(peer, &path).await?;
+        }
+
+        // If we cancelled the current transfer, start the next queued one.
+        // Note: individual cancel() calls would have already tried to start
+        // the next, but we ensure it here in case the last cancelled was current.
+        if was_current && self.current_transfer.is_none() && !self.queued_pulls.is_empty() {
+            if let Some(next) = self.queued_pulls.pop_front() {
+                println!(
+                    "sync: serial mode - starting next queued pull for {} from peer {} (after cancel_peer)",
+                    next.resource_path, next.peer
+                );
+                let _ = self.start_pull(StartPullParams {
+                    data_dir: &next.data_dir,
+                    fetch_queue: &next.fetch_queue,
+                    peer: next.peer,
+                    resource_path: next.resource_path,
+                    expected_checksum: next.expected_checksum,
+                    event_kind: next.event_kind,
+                    destination_path: next.destination_path,
+                    username: next.username,
+                }).await;
+            }
         }
 
         Ok(())
@@ -542,7 +627,7 @@ impl SyncState {
         transfer.last_activity = std::time::Instant::now();
 
         let mut requests = Vec::new();
-        let window = configured_window_requests();
+        let window = if configured_serial_mode() { 1 } else { configured_window_requests() };
         let chunk_size = configured_chunk_size() as u64;
         while transfer.in_flight < window {
             let offset = transfer.next_request_offset;
@@ -584,9 +669,32 @@ impl SyncState {
     }
 
     async fn cancel(&mut self, peer: PeerId, path: &str) -> io::Result<()> {
+        let was_current = configured_serial_mode()
+            && self.current_transfer.as_ref().is_some_and(|(p, pt)| *p == peer && *pt == path);
+
         if let Some(transfer) = self.pending.remove(&(peer, path.to_string())) {
             drop(transfer.file);
             let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
+        }
+
+        if was_current {
+            self.current_transfer = None;
+            if let Some(next) = self.queued_pulls.pop_front() {
+                println!(
+                    "sync: serial mode - starting next queued pull for {} from peer {} (after cancel)",
+                    next.resource_path, next.peer
+                );
+                let _ = self.start_pull(StartPullParams {
+                    data_dir: &next.data_dir,
+                    fetch_queue: &next.fetch_queue,
+                    peer: next.peer,
+                    resource_path: next.resource_path,
+                    expected_checksum: next.expected_checksum,
+                    event_kind: next.event_kind,
+                    destination_path: next.destination_path,
+                    username: next.username,
+                }).await;
+            }
         }
 
         Ok(())
@@ -599,6 +707,27 @@ impl SyncState {
     async fn start_pull(&mut self, params: StartPullParams<'_>) -> io::Result<()> {
         let key = (params.peer, params.resource_path.clone());
         if self.pending.contains_key(&key) {
+            return Ok(());
+        }
+
+        // Serial mode: if another transfer is active, queue this one.
+        if configured_serial_mode() && self.current_transfer.is_some() {
+            println!(
+                "sync: serial mode - queuing pull for {} from peer {} (waiting for {})",
+                params.resource_path,
+                params.peer,
+                self.current_transfer.as_ref().unwrap().1
+            );
+            self.queued_pulls.push_back(QueuedPullParams {
+                data_dir: params.data_dir.to_path_buf(),
+                fetch_queue: params.fetch_queue.clone(),
+                peer: params.peer,
+                resource_path: params.resource_path.clone(),
+                expected_checksum: params.expected_checksum,
+                event_kind: params.event_kind,
+                destination_path: params.destination_path,
+                username: params.username,
+            });
             return Ok(());
         }
 
@@ -651,6 +780,10 @@ impl SyncState {
             },
         );
 
+        if configured_serial_mode() {
+            self.current_transfer = Some((params.peer, params.resource_path.clone()));
+        }
+
         params
             .fetch_queue
             .push(SyncRequest::FetchFile {
@@ -699,13 +832,35 @@ impl SyncState {
                 "sync: finalized empty file {}",
                 transfer.final_path.display()
             );
+
+            // Serial mode: clear current transfer and start next queued.
+            if configured_serial_mode() {
+                self.current_transfer = None;
+                if let Some(next) = self.queued_pulls.pop_front() {
+                    println!(
+                        "sync: serial mode - starting next queued pull for {} from peer {}",
+                        next.resource_path, next.peer
+                    );
+                    let _ = self.start_pull(StartPullParams {
+                        data_dir: &next.data_dir,
+                        fetch_queue: &next.fetch_queue,
+                        peer: next.peer,
+                        resource_path: next.resource_path,
+                        expected_checksum: next.expected_checksum,
+                        event_kind: next.event_kind,
+                        destination_path: next.destination_path,
+                        username: next.username,
+                    }).await;
+                }
+            }
             return Ok(Vec::new());
         }
 
         if data.is_empty() {
             // Chunks we already passed (e.g. a retried request racing the
             // original response) carry no new data; just refill the window.
-            return Ok(refill_window(transfer, &path, configured_window_requests()));
+            let window = if configured_serial_mode() { 1 } else { configured_window_requests() };
+            return Ok(refill_window(transfer, &path, window));
         }
 
         transfer.buffered.entry(offset).or_insert(data);
@@ -737,7 +892,8 @@ impl SyncState {
         }
 
         if transfer.write_offset < total_size {
-            return Ok(refill_window(transfer, &path, configured_window_requests()));
+            let window = if configured_serial_mode() { 1 } else { configured_window_requests() };
+            return Ok(refill_window(transfer, &path, window));
         }
 
         let mut transfer = self.pending.remove(&key).expect("checked above");
@@ -755,6 +911,26 @@ impl SyncState {
             );
             println!("sync: remove temp file {}", transfer.tmp_path.display());
             let _ = tokio::fs::remove_file(&transfer.tmp_path).await;
+            // Serial mode: clear current transfer and start next queued.
+            if configured_serial_mode() {
+                self.current_transfer = None;
+                if let Some(next) = self.queued_pulls.pop_front() {
+                    println!(
+                        "sync: serial mode - starting next queued pull for {} from peer {}",
+                        next.resource_path, next.peer
+                    );
+                    let _ = self.start_pull(StartPullParams {
+                        data_dir: &next.data_dir,
+                        fetch_queue: &next.fetch_queue,
+                        peer: next.peer,
+                        resource_path: next.resource_path,
+                        expected_checksum: next.expected_checksum,
+                        event_kind: next.event_kind,
+                        destination_path: next.destination_path,
+                        username: next.username,
+                    }).await;
+                }
+            }
             return Ok(Vec::new());
         }
 
@@ -774,6 +950,27 @@ impl SyncState {
             status_code: 200,
             username: transfer.username,
         });
+
+        // Serial mode: clear current transfer and start next queued.
+        if configured_serial_mode() {
+            self.current_transfer = None;
+            if let Some(next) = self.queued_pulls.pop_front() {
+                println!(
+                    "sync: serial mode - starting next queued pull for {} from peer {}",
+                    next.resource_path, next.peer
+                );
+                let _ = self.start_pull(StartPullParams {
+                    data_dir: &next.data_dir,
+                    fetch_queue: &next.fetch_queue,
+                    peer: next.peer,
+                    resource_path: next.resource_path,
+                    expected_checksum: next.expected_checksum,
+                    event_kind: next.event_kind,
+                    destination_path: next.destination_path,
+                    username: next.username,
+                }).await;
+            }
+        }
 
         Ok(Vec::new())
     }

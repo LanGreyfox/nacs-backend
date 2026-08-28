@@ -39,6 +39,8 @@ You can override host and port with environment variables:
 - `WEBDAV_PORT` — bind port (default: `4918`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
 - `SYNC_CHUNK_SIZE_BYTES` — P2P sync chunk size in bytes (default: `2097152`, i.e. 2 MiB)
+- `SYNC_WINDOW_REQUESTS` — number of in-flight chunk requests per transfer (default: `4`)
+- `SYNC_SERIAL` — enable serial sync mode: `1`/`true`/`yes`/`on` (default: `0`); forces only one file transfer at a time globally and window=1 (no pipelining)
 
 ## Authentication
 
@@ -79,6 +81,8 @@ Each stored record includes the current folder, whether the resource is a file o
 - File contents are pulled on demand through `FetchFile` requests and `Chunk` responses.
 - Transfers are limited to 2 MiB per chunk by default and are verified with CRC32 before the file is materialized locally.
 - You can tune chunk size via `SYNC_CHUNK_SIZE_BYTES`; invalid values fall back to the default with a warning.
+- Pipelined chunk requests: up to `SYNC_WINDOW_REQUESTS` (default: 4) in-flight chunk requests per transfer. Out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size.
+- **Serial sync mode** (optional): set `SYNC_SERIAL=1` to force only one file transfer at a time globally (FIFO queue) and disable pipelining (window forced to 1). Chunk size remains configurable via `SYNC_CHUNK_SIZE_BYTES`. Useful for low-memory devices like Raspberry Pi 2 to avoid connection drops.
 - The wire protocol uses libp2p request-response with CBOR encoding under `/nacs-backend/sync/1`.
 
 This keeps the sync path bounded in memory and avoids eager pushes of file bytes.
@@ -100,6 +104,8 @@ export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
 export P2P_PORT="4001"
 export SYNC_CHUNK_SIZE_BYTES="2097152"
+export SYNC_WINDOW_REQUESTS="4"
+export SYNC_SERIAL="0"
 cargo run
 ```
 
@@ -112,19 +118,25 @@ Start three instances in separate terminals so each node has unique WebDAV and P
 Terminal 1:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
 ```
 
 Terminal 2:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
 ```
 
 Terminal 3:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" SYNC_CHUNK_SIZE_BYTES="2097152" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
+```
+
+For Raspberry Pi 2 or other low-memory devices, enable serial mode to reduce concurrent connections:
+
+```bash
+SYNC_SERIAL=1 SYNC_CHUNK_SIZE_BYTES=4194304 cargo run
 ```
 
 Expected behavior:
