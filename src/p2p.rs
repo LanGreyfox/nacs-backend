@@ -369,9 +369,10 @@ pub async fn run_discovery(
                         error,
                         ..
                     })) => {
-                        eprintln!("sync request to {peer} failed (id={request_id}): {error}");
-                        // In serial mode, the current transfer fails - we just log and let it timeout
-                        // The next transfer will start when the current one is cleaned up
+                        eprintln!("sync request to {peer} failed (id={request_id}): {error}; retrying");
+                        if let Some(retry_request) = sync_state.retry_current() {
+                            let _ = swarm.behaviour_mut().sync.send_request(&peer, retry_request);
+                        }
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::InboundFailure {
                         peer,

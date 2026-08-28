@@ -107,6 +107,8 @@ pub struct SyncState {
     current_transfer: Option<QueuedPullParams>,
     /// FIFO queue of pulls waiting for the current transfer to finish.
     queued_pulls: VecDeque<QueuedPullParams>,
+    /// Retry count for current transfer (reset on success or new transfer)
+    current_retry: u32,
 }
 
 impl SyncState {
@@ -162,6 +164,7 @@ impl SyncState {
                 username,
             };
             self.current_transfer = Some(params);
+            self.current_retry = 0;
             println!(
                 "sync: start pull for {} from peer {}",
                 resource_path, peer
@@ -198,7 +201,7 @@ impl SyncState {
             return None;
         }
 
-        self.current_transfer = None;
+self.current_transfer = None;
 
         // Start next queued pull
         if let Some(next) = self.queued_pulls.pop_front() {
@@ -207,6 +210,7 @@ impl SyncState {
                 next.resource_path, next.peer
             );
             self.current_transfer = Some(next.clone());
+            self.current_retry = 0;
             return Some(SyncRequest::FetchFile {
                 path: next.resource_path,
             });
@@ -215,7 +219,44 @@ impl SyncState {
         None
     }
 
-/// Cancels all transfers for a peer. Returns next request if a new transfer starts.
+    /// Retry the current transfer from the beginning (increment retry count).
+    /// Returns the FetchFile request to resend, or None if max retries exceeded.
+    pub fn retry_current(&mut self) -> Option<SyncRequest> {
+        const MAX_RETRIES: u32 = 3;
+        if self.current_retry >= MAX_RETRIES {
+            eprintln!("sync: max retries ({MAX_RETRIES}) exceeded for current transfer, giving up");
+            self.current_transfer = None;
+            self.current_retry = 0;
+            // Start next queued pull
+            if let Some(next) = self.queued_pulls.pop_front() {
+                println!(
+                    "sync: starting next queued pull for {} from peer {} (after retries exhausted)",
+                    next.resource_path, next.peer
+                );
+                self.current_transfer = Some(next.clone());
+                self.current_retry = 0;
+                return Some(SyncRequest::FetchFile {
+                    path: next.resource_path,
+                });
+            }
+            return None;
+        }
+
+        self.current_retry += 1;
+        if let Some(current) = &self.current_transfer {
+            println!(
+                "sync: retrying transfer for {} from peer {} (attempt {}/{})",
+                current.resource_path, current.peer, self.current_retry, MAX_RETRIES
+            );
+            Some(SyncRequest::FetchFile {
+                path: current.resource_path.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Cancels all transfers for a peer. Returns next request if a new transfer starts.
     pub async fn cancel_peer(&mut self, peer: PeerId) -> io::Result<Option<SyncRequest>> {
         let was_current = self
             .current_transfer
@@ -227,6 +268,7 @@ impl SyncState {
 
         if was_current {
             self.current_transfer = None;
+            self.current_retry = 0;
             // Start next queued pull (from any peer)
             if let Some(next) = self.queued_pulls.pop_front() {
                 println!(
@@ -234,6 +276,7 @@ impl SyncState {
                     next.resource_path, next.peer
                 );
                 self.current_transfer = Some(next.clone());
+                self.current_retry = 0;
                 return Ok(Some(SyncRequest::FetchFile {
                     path: next.resource_path,
                 }));
@@ -571,26 +614,31 @@ pub async fn handle_file_response(
 ) -> io::Result<Option<SyncRequest>> {
     println!("sync: received file {} ({} bytes)", path, data.len());
 
-    // Verify checksum
+// Verify checksum
     let mut hasher = Hasher::new();
     hasher.update(&data);
     let actual_checksum = format!("{:08x}", hasher.finalize());
 
     if actual_checksum != checksum {
         eprintln!(
-            "sync: checksum mismatch for {} from peer {} (expected {}, got {}); discarding",
+            "sync: checksum mismatch for {} from peer {} (expected {}, got {}); retrying",
             path, peer, checksum, actual_checksum
         );
-        let next = state.finish_transfer(peer, &path);
-        return Ok(next);
+        return Ok(state.retry_current());
     }
 
     // Write file
     let final_path = fs_path_from_wire_path(data_dir, &path);
     if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            eprintln!("sync: failed to create dir for {}: {}; retrying", path, err);
+            return Ok(state.retry_current());
+        }
     }
-    tokio::fs::write(&final_path, &data).await?;
+    if let Err(err) = tokio::fs::write(&final_path, &data).await {
+        eprintln!("sync: failed to write {}: {}; retrying", path, err);
+        return Ok(state.retry_current());
+    }
 
     println!("sync: finalized file {}", final_path.display());
 
@@ -617,8 +665,8 @@ pub async fn handle_not_found(
     peer: PeerId,
     path: &str,
 ) -> Option<SyncRequest> {
-    println!("sync: peer {} no longer has {}; dropping transfer", peer, path);
-    state.finish_transfer(peer, path)
+    println!("sync: peer {} no longer has {}; retrying", peer, path);
+    state.retry_current()
 }
 
 /// Applies the actions computed by [`diff_manifests`] against local state.

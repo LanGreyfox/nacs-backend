@@ -553,6 +553,25 @@ async fn handle_file_response_discards_on_checksum_mismatch() {
     .await
     .expect("file response handling should not error even on mismatch");
 
+    // After checksum mismatch, it should retry (up to 3 times)
+    // First call retries, second call retries, third call retries, fourth call gives up
+    for _ in 0..3 {
+        sync::handle_file_response(
+            &data_dir,
+            &database,
+            &mut state,
+            peer,
+            "/bad.txt".to_string(),
+            content.to_vec(),
+            "wrong-checksum".to_string(),
+            EventKind::Created,
+            "peer:test".to_string(),
+        )
+        .await
+        .expect("file response handling should not error even on mismatch");
+    }
+
+    // After max retries, it should give up and not be busy
     assert!(
         !data_dir.join("bad.txt").exists(),
         "file with mismatched checksum must not be materialized"
@@ -587,8 +606,10 @@ async fn handle_not_found_removes_pending_transfer() {
     );
     assert!(state.is_busy());
 
-    // Handle NotFound response
-    sync::handle_not_found(&mut state, peer, "/missing.txt").await;
+    // Handle NotFound response - should retry up to 3 times then give up
+    for _ in 0..4 {
+        sync::handle_not_found(&mut state, peer, "/missing.txt").await;
+    }
 
     assert!(!state.is_busy());
 
