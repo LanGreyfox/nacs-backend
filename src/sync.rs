@@ -374,16 +374,20 @@ impl SyncState {
         total_size: u64,
         checksum: String,
     ) -> io::Result<Option<SyncRequest>> {
+        println!("sync: handle_file_start called for {} ({} bytes)", path, total_size);
         let Some(transfer) = self.current_transfer.as_mut() else {
+            println!("sync: handle_file_start - no current transfer");
             return Ok(None);
         };
 
         if transfer.params.resource_path != path {
+            println!("sync: handle_file_start - path mismatch: expected {}, got {}", transfer.params.resource_path, path);
             return Ok(None);
         }
 
         let final_path = fs_path_from_wire_path(data_dir, &path);
         let temp_path = final_path.with_extension("p2p-tmp");
+        println!("sync: creating temp file at {}", temp_path.display());
 
         // Create temp file
         let file = std::fs::OpenOptions::new()
@@ -423,17 +427,21 @@ impl SyncState {
         offset: u64,
         is_last: bool,
     ) -> io::Result<Option<SyncRequest>> {
+        println!("sync: handle_file_chunk for {} (offset={}, size={}, last={})", path, offset, data.len(), is_last);
         let Some(transfer) = self.current_transfer.as_mut() else {
+            println!("sync: handle_file_chunk - no current transfer");
             return Ok(None);
         };
 
         if transfer.params.resource_path != path {
+            println!("sync: handle_file_chunk - path mismatch: expected {}, got {}", transfer.params.resource_path, path);
             return Ok(None);
         }
 
         // Write chunk to temp file
         use tokio::io::AsyncWriteExt;
         transfer.file.as_mut().unwrap().write_all(&data).await?;
+        println!("sync: wrote chunk to temp file, total written so far: {}", transfer.next_chunk_offset + data.len() as u64);
         transfer.hasher.update(&data);
         transfer.next_chunk_offset = offset + data.len() as u64;
 
@@ -921,12 +929,11 @@ pub async fn handle_fetch_request(
     path: &str,
 ) -> SyncResponse {
     let fs_path = fs_path_from_wire_path(data_dir, path);
+    println!("sync: fetch request for {} -> fs_path={}", path, fs_path.display());
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
         Err(err) => {
-            if err.kind() != io::ErrorKind::NotFound {
-                eprintln!("sync: failed to stat {path} for fetch request: {err}");
-            }
+            eprintln!("sync: failed to stat {} (fs_path={}): {}", path, fs_path.display(), err);
             return SyncResponse::NotFound {
                 path: path.to_string(),
             };
@@ -939,7 +946,7 @@ pub async fn handle_fetch_request(
         Ok(Some(cs)) => cs,
         Ok(None) => "empty".to_string(),
         Err(err) => {
-            eprintln!("sync: failed to compute checksum for {path}: {err}");
+            eprintln!("sync: failed to compute checksum for {}: {}", path, err);
             return SyncResponse::NotFound {
                 path: path.to_string(),
             };
