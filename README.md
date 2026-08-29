@@ -3,8 +3,8 @@
 This repository contains a WebDAV server built with dav-server and Tokio.
 
 The server also persists WebDAV file events to SQLite through a background worker.
-It now includes a P2P file replication layer that can exchange manifests and
-transfer file contents in chunked pull-based requests.
+It now includes a P2P file replication layer that exchanges manifests and
+transfers file contents using **serial chunked pull-based requests** (one file at a time globally, FIFO queue, streamed in 1 MiB chunks).
 
 ## Requirements
 
@@ -16,7 +16,7 @@ transfer file contents in chunked pull-based requests.
 - `src/webdav.rs` — WebDAV request handling, auth, and event mapping
 - `src/db.rs` — SQLite persistence layer and background worker
 - `src/p2p.rs` — libp2p discovery, heartbeat, and peer connection lifecycle
-- `src/sync.rs` — P2P file replication protocol, manifest diffing, and chunked transfers
+- `src/sync.rs` — P2P file replication protocol, manifest diffing, and **serial chunked transfers**
 - `tests/webdav_tests.rs` — WebDAV helper tests
 - `tests/db_tests.rs` — SQLite persistence integration tests
 - `tests/p2p_tests.rs` — P2P identity/discovery helper tests
@@ -38,9 +38,13 @@ You can override host and port with environment variables:
 - `WEBDAV_HOST` — bind host/IP (default: `127.0.0.1`)
 - `WEBDAV_PORT` — bind port (default: `4918`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
-- `SYNC_CHUNK_SIZE_BYTES` — P2P sync chunk size in bytes (default: `2097152`, i.e. 2 MiB)
-- `SYNC_WINDOW_REQUESTS` — number of in-flight chunk requests per transfer (default: `4`)
-- `SYNC_SERIAL` — enable serial sync mode: `1`/`true`/`yes`/`on` (default: `0`); forces only one file transfer at a time globally and window=1 (no pipelining)
+
+**Sync configuration (hardcoded defaults):**
+- Chunk size: **1 MiB** (1048576 bytes) — hardcoded in `sync.rs`, not configurable via env var
+- Serial mode: **always enabled** — one file transfer at a time globally, FIFO queue, no pipelining
+- Sync request timeout: **30 minutes** (for large file transfers)
+- Idle connection timeout: **5 minutes** (to allow slow chunk transfers)
+- Max response size: **200 MB**
 
 ## Authentication
 
@@ -78,11 +82,9 @@ Each stored record includes the current folder, whether the resource is a file o
 
 - Nodes exchange a manifest that includes live resources and tombstones.
 - Sync decisions are made with last-write-wins timestamp comparison.
-- File contents are pulled on demand through `FetchFile` requests and `Chunk` responses.
-- Transfers are limited to 2 MiB per chunk by default and are verified with CRC32 before the file is materialized locally.
-- You can tune chunk size via `SYNC_CHUNK_SIZE_BYTES`; invalid values fall back to the default with a warning.
-- Pipelined chunk requests: up to `SYNC_WINDOW_REQUESTS` (default: 4) in-flight chunk requests per transfer. Out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size.
-- **Serial sync mode** (optional): set `SYNC_SERIAL=1` to force only one file transfer at a time globally (FIFO queue) and disable pipelining (window forced to 1). Chunk size remains configurable via `SYNC_CHUNK_SIZE_BYTES`. Useful for low-memory devices like Raspberry Pi 2 to avoid connection drops.
+- File contents are pulled on demand through `FetchFile` requests and `FetchFileChunk`/`FileChunk` responses (chunked streaming).
+- Transfers use **1 MiB chunks** (hardcoded) and are verified with CRC32 before the file is materialized locally.
+- **Serial mode is always enabled**: only one file transfer at a time globally, FIFO queue, no pipelining (window effectively 1).
 - The wire protocol uses libp2p request-response with CBOR encoding under `/nacs-backend/sync/1`.
 
 This keeps the sync path bounded in memory and avoids eager pushes of file bytes.
@@ -92,6 +94,7 @@ Current failure/reconnect semantics:
 - On heartbeat failure, the peer is removed from active peer tracking immediately.
 - Failed dials and disconnects are not retried automatically.
 - Reconnect happens only when mDNS discovers the peer again.
+- Active transfers retry up to 3 times on checksum mismatch or failure before moving to the next queued file.
 
 ## Build & Run
 
@@ -103,13 +106,12 @@ export WEBDAV_PASS="yourpassword"
 export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
 export P2P_PORT="4001"
-export SYNC_CHUNK_SIZE_BYTES="2097152"
-export SYNC_WINDOW_REQUESTS="4"
-export SYNC_SERIAL="0"
 cargo run
 ```
 
 If `P2P_PORT` is not set, the application listens on `4001`.
+
+Sync parameters (chunk size, serial mode, timeouts) are hardcoded defaults — see "Default configuration" above.
 
 ## Multi-instance example (3 nodes)
 
@@ -118,25 +120,25 @@ Start three instances in separate terminals so each node has unique WebDAV and P
 Terminal 1:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4918" P2P_PORT="4001" cargo run
 ```
 
 Terminal 2:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4919" P2P_PORT="4002" cargo run
 ```
 
 Terminal 3:
 
 ```bash
-WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" SYNC_CHUNK_SIZE_BYTES="2097152" SYNC_WINDOW_REQUESTS="4" SYNC_SERIAL="0" cargo run
+WEBDAV_USER="youruser" WEBDAV_PASS="yourpassword" WEBDAV_HOST="127.0.0.1" WEBDAV_PORT="4920" P2P_PORT="4003" cargo run
 ```
 
-For Raspberry Pi 2 or other low-memory devices, enable serial mode to reduce concurrent connections:
+For Raspberry Pi 2 or other low-memory devices, the serial chunked mode (1 MiB chunks, one file at a time) is the default and requires no special configuration:
 
 ```bash
-SYNC_SERIAL=1 SYNC_CHUNK_SIZE_BYTES=4194304 cargo run
+cargo run
 ```
 
 Expected behavior:
@@ -166,7 +168,7 @@ Linux Dolphin example URL:
 - The Basic Auth header is parsed as standard HTTP Basic Auth (`Authorization: Basic <base64(user:pass)>`) and then compared to `WEBDAV_USER`/`WEBDAV_PASS`.
 - SQLite writes are handled by a dedicated background worker, so the WebDAV request path stays responsive.
 - Checksum values are computed for files and stored in the database.
-- P2P sync currently replicates file and folder state by exchanging manifests and pulling content only when needed.
+- P2P sync currently replicates file and folder state by exchanging manifests and pulling content only when needed, using **serial chunked transfers (1 MiB chunks, one file at a time)**.
 - For P2P, encryption is enabled at the transport layer, but mutual peer authentication is still a planned enhancement.
 - If you prefer a different behavior (for example: allow missing credentials, read from a config file, or support multiple users), I can update the implementation accordingly.
 
