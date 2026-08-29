@@ -12,8 +12,7 @@ use libp2p::{
     PeerId, StreamProtocol, SwarmBuilder,
     core::{Endpoint, Multiaddr, transport::PortUse, upgrade::DeniedUpgrade},
     futures::StreamExt,
-    identity, mdns, noise, ping,
-    request_response::self,
+    identity, mdns, noise, ping, request_response,
     swarm::{
         ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent, ConnectionId,
         StreamUpgradeError, SubstreamProtocol, SwarmEvent, THandler, THandlerInEvent,

@@ -8,8 +8,8 @@ use crc32fast::Hasher;
 use libp2p::PeerId;
 use nacs_backend::db::{Database, EventKind, Manifest, ManifestEntry, TombstoneEntry};
 use nacs_backend::sync::{
-    self, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState,
-    diff_manifests, handle_fetch_request, handle_file_start, handle_file_chunk,
+    self, FileChangeEvent, SyncAction, SyncRequest, SyncResponse, SyncState, diff_manifests,
+    handle_fetch_request, handle_file_chunk, handle_file_start,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -442,7 +442,11 @@ async fn fetch_request_returns_file_start() {
     let response = handle_fetch_request(&data_dir, "/test.txt").await;
 
     match response {
-        SyncResponse::FileStart { total_size, checksum, .. } => {
+        SyncResponse::FileStart {
+            total_size,
+            checksum,
+            ..
+        } => {
             assert_eq!(total_size, content.len() as u64);
             assert_eq!(checksum, crc32_hex(content));
         }
@@ -761,15 +765,32 @@ async fn cancel_peer_removes_queued_transfers() {
     let mut state = SyncState::new();
 
     // Start transfer from peer1
-    state.start_pull(&data_dir, peer1, "/file1.txt".to_string(), None, EventKind::Created, "peer:test".to_string());
+    state.start_pull(
+        &data_dir,
+        peer1,
+        "/file1.txt".to_string(),
+        None,
+        EventKind::Created,
+        "peer:test".to_string(),
+    );
     // Queue transfer from peer2
-    state.start_pull(&data_dir, peer2, "/file2.txt".to_string(), None, EventKind::Created, "peer:test".to_string());
+    state.start_pull(
+        &data_dir,
+        peer2,
+        "/file2.txt".to_string(),
+        None,
+        EventKind::Created,
+        "peer:test".to_string(),
+    );
 
     assert!(state.is_pending(peer1, "/file1.txt"));
     assert!(state.is_pending(peer2, "/file2.txt"));
 
     // Cancel peer1 - peer2's transfer should start
-    let next = state.cancel_peer(peer1).await.expect("cancel should succeed");
+    let next = state
+        .cancel_peer(peer1)
+        .await
+        .expect("cancel should succeed");
     assert!(next.is_some());
     assert!(!state.is_pending(peer1, "/file1.txt"));
     assert!(state.is_pending(peer2, "/file2.txt"));
@@ -783,7 +804,10 @@ async fn cancel_peer_when_idle_does_nothing() {
     let mut state = SyncState::new();
     let peer = PeerId::random();
 
-    let next = state.cancel_peer(peer).await.expect("cancel should succeed");
+    let next = state
+        .cancel_peer(peer)
+        .await
+        .expect("cancel should succeed");
     assert!(next.is_none());
     assert!(!state.is_busy());
 }
@@ -802,9 +826,16 @@ async fn apply_manifest_actions_creates_dirs_and_deletes() {
     let mut state = SyncState::new();
 
     let actions = vec![
-        SyncAction::CreateDir { path: "/newdir".to_string() },
-        SyncAction::Delete { path: "/old.txt".to_string() },
-        SyncAction::Pull { path: "/file.txt".to_string(), checksum: Some("abc".to_string()) },
+        SyncAction::CreateDir {
+            path: "/newdir".to_string(),
+        },
+        SyncAction::Delete {
+            path: "/old.txt".to_string(),
+        },
+        SyncAction::Pull {
+            path: "/file.txt".to_string(),
+            checksum: Some("abc".to_string()),
+        },
     ];
 
     sync::apply_manifest_actions(&data_dir, &database, &mut state, peer, actions).await;

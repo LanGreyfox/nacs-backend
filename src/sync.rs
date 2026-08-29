@@ -148,10 +148,16 @@ impl SyncState {
 
     /// Returns true if a pull for (peer, path) is either active or queued.
     pub fn is_pending(&self, peer: PeerId, path: &str) -> bool {
-        if self.current_transfer.as_ref().is_some_and(|p| p.params.peer == peer && p.params.resource_path == path) {
+        if self
+            .current_transfer
+            .as_ref()
+            .is_some_and(|p| p.params.peer == peer && p.params.resource_path == path)
+        {
             return true;
         }
-        self.queued_pulls.iter().any(|q| q.peer == peer && q.resource_path == path)
+        self.queued_pulls
+            .iter()
+            .any(|q| q.peer == peer && q.resource_path == path)
     }
 
     /// Returns the number of queued pulls waiting.
@@ -161,12 +167,16 @@ impl SyncState {
 
     /// Returns the event_kind and username for the current transfer, if any.
     pub fn current_transfer_info(&self) -> Option<(EventKind, String)> {
-        self.current_transfer.as_ref().map(|p| (p.params.event_kind, p.params.username.clone()))
+        self.current_transfer
+            .as_ref()
+            .map(|p| (p.params.event_kind, p.params.username.clone()))
     }
 
     /// Returns the current transfer's resource path, if any.
     pub fn current_transfer_path(&self) -> Option<String> {
-        self.current_transfer.as_ref().map(|p| p.params.resource_path.clone())
+        self.current_transfer
+            .as_ref()
+            .map(|p| p.params.resource_path.clone())
     }
 
     /// Starts a pull if idle, otherwise queues it.
@@ -206,11 +216,10 @@ impl SyncState {
                 file: None,
             });
             self.current_retry = 0;
-            println!(
-                "sync: start pull for {} from peer {}",
-                resource_path, peer
-            );
-            Some(SyncRequest::FetchFile { path: resource_path })
+            println!("sync: start pull for {} from peer {}", resource_path, peer);
+            Some(SyncRequest::FetchFile {
+                path: resource_path,
+            })
         } else {
             // Queue it
             println!(
@@ -374,14 +383,20 @@ impl SyncState {
         total_size: u64,
         checksum: String,
     ) -> io::Result<Option<SyncRequest>> {
-        println!("sync: handle_file_start called for {} ({} bytes)", path, total_size);
+        println!(
+            "sync: handle_file_start called for {} ({} bytes)",
+            path, total_size
+        );
         let Some(transfer) = self.current_transfer.as_mut() else {
             println!("sync: handle_file_start - no current transfer");
             return Ok(None);
         };
 
         if transfer.params.resource_path != path {
-            println!("sync: handle_file_start - path mismatch: expected {}, got {}", transfer.params.resource_path, path);
+            println!(
+                "sync: handle_file_start - path mismatch: expected {}, got {}",
+                transfer.params.resource_path, path
+            );
             return Ok(None);
         }
 
@@ -407,7 +422,10 @@ impl SyncState {
         transfer.next_chunk_offset = 0;
         transfer.file = Some(async_file);
 
-        println!("sync: file start {} ({} bytes), requesting first chunk", path, total_size);
+        println!(
+            "sync: file start {} ({} bytes), requesting first chunk",
+            path, total_size
+        );
 
         // Request first chunk
         Ok(Some(SyncRequest::FetchFileChunk {
@@ -427,21 +445,33 @@ impl SyncState {
         offset: u64,
         is_last: bool,
     ) -> io::Result<Option<SyncRequest>> {
-        println!("sync: handle_file_chunk for {} (offset={}, size={}, last={})", path, offset, data.len(), is_last);
+        println!(
+            "sync: handle_file_chunk for {} (offset={}, size={}, last={})",
+            path,
+            offset,
+            data.len(),
+            is_last
+        );
         let Some(transfer) = self.current_transfer.as_mut() else {
             println!("sync: handle_file_chunk - no current transfer");
             return Ok(None);
         };
 
         if transfer.params.resource_path != path {
-            println!("sync: handle_file_chunk - path mismatch: expected {}, got {}", transfer.params.resource_path, path);
+            println!(
+                "sync: handle_file_chunk - path mismatch: expected {}, got {}",
+                transfer.params.resource_path, path
+            );
             return Ok(None);
         }
 
         // Write chunk to temp file
         use tokio::io::AsyncWriteExt;
         transfer.file.as_mut().unwrap().write_all(&data).await?;
-        println!("sync: wrote chunk to temp file, total written so far: {}", transfer.next_chunk_offset + data.len() as u64);
+        println!(
+            "sync: wrote chunk to temp file, total written so far: {}",
+            transfer.next_chunk_offset + data.len() as u64
+        );
         transfer.hasher.update(&data);
         transfer.next_chunk_offset = offset + data.len() as u64;
 
@@ -517,7 +547,13 @@ fn latest_states(manifest: &Manifest) -> HashMap<String, (String, PathState)> {
     for tombstone in &manifest.tombstones {
         map.insert(
             tombstone.resource_path.clone(),
-            (tombstone.deleted_at.clone(), PathState { resource_kind: "deleted".to_string(), checksum: None }),
+            (
+                tombstone.deleted_at.clone(),
+                PathState {
+                    resource_kind: "deleted".to_string(),
+                    checksum: None,
+                },
+            ),
         );
     }
     map
@@ -593,8 +629,17 @@ pub fn diff_manifests(local: &Manifest, remote: &Manifest) -> Vec<SyncAction> {
         // If both sides already report the same file checksum, skip timestamp-based
         // reconciliation to prevent repeated transfers caused by clock/mtime drift.
         if let (
-            PathState { resource_kind: remote_kind, checksum: remote_checksum },
-            Some((_, PathState { resource_kind: local_kind, checksum: local_checksum })),
+            PathState {
+                resource_kind: remote_kind,
+                checksum: remote_checksum,
+            },
+            Some((
+                _,
+                PathState {
+                    resource_kind: local_kind,
+                    checksum: local_checksum,
+                },
+            )),
         ) = (remote_state, local_state)
             && remote_kind == "file"
             && local_kind == "file"
@@ -614,14 +659,20 @@ pub fn diff_manifests(local: &Manifest, remote: &Manifest) -> Vec<SyncAction> {
         }
 
         match remote_state {
-            PathState { resource_kind, checksum: _ } if resource_kind == "deleted" => {
+            PathState {
+                resource_kind,
+                checksum: _,
+            } if resource_kind == "deleted" => {
                 if let Some((_, PathState { resource_kind, .. })) = local_states.get(path) {
                     if resource_kind != "deleted" {
                         actions.push(SyncAction::Delete { path: path.clone() });
                     }
                 }
             }
-            PathState { resource_kind, checksum } if resource_kind == "folder" => {
+            PathState {
+                resource_kind,
+                checksum,
+            } if resource_kind == "folder" => {
                 actions.push(SyncAction::CreateDir { path: path.clone() });
                 let _ = checksum;
             }
@@ -841,8 +892,16 @@ pub async fn handle_file_chunk(
     offset: u64,
     is_last: bool,
 ) -> io::Result<Option<SyncRequest>> {
-    println!("sync: received chunk {} ({} bytes, offset {}, last={})", path, data.len(), offset, is_last);
-    state.handle_file_chunk(data_dir, database, path, data, offset, is_last).await
+    println!(
+        "sync: received chunk {} ({} bytes, offset {}, last={})",
+        path,
+        data.len(),
+        offset,
+        is_last
+    );
+    state
+        .handle_file_chunk(data_dir, database, path, data, offset, is_last)
+        .await
 }
 
 /// Handles NotFound response - peer doesn't have the file.
@@ -924,16 +983,22 @@ pub async fn apply_manifest_actions(
 }
 
 /// Handles the sender side: returns file metadata (start).
-pub async fn handle_fetch_request(
-    data_dir: &Path,
-    path: &str,
-) -> SyncResponse {
+pub async fn handle_fetch_request(data_dir: &Path, path: &str) -> SyncResponse {
     let fs_path = fs_path_from_wire_path(data_dir, path);
-    println!("sync: fetch request for {} -> fs_path={}", path, fs_path.display());
+    println!(
+        "sync: fetch request for {} -> fs_path={}",
+        path,
+        fs_path.display()
+    );
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
         Err(err) => {
-            eprintln!("sync: failed to stat {} (fs_path={}): {}", path, fs_path.display(), err);
+            eprintln!(
+                "sync: failed to stat {} (fs_path={}): {}",
+                path,
+                fs_path.display(),
+                err
+            );
             return SyncResponse::NotFound {
                 path: path.to_string(),
             };
@@ -962,11 +1027,7 @@ pub async fn handle_fetch_request(
 }
 
 /// Handles a chunk request from the receiver.
-pub async fn handle_fetch_chunk(
-    data_dir: &Path,
-    path: &str,
-    offset: u64,
-) -> SyncResponse {
+pub async fn handle_fetch_chunk(data_dir: &Path, path: &str, offset: u64) -> SyncResponse {
     let fs_path = fs_path_from_wire_path(data_dir, path);
     let metadata = match tokio::fs::metadata(&fs_path).await {
         Ok(m) => m,
@@ -1044,7 +1105,14 @@ mod tests {
         let peer = PeerId::random();
         let path = "/test.txt".to_string();
 
-        let req = state.start_pull(Path::new("."), peer, path.clone(), None, EventKind::Created, "user".to_string());
+        let req = state.start_pull(
+            Path::new("."),
+            peer,
+            path.clone(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
         assert!(req.is_some());
         assert!(state.is_busy());
         assert!(state.is_pending(peer, &path));
@@ -1055,8 +1123,22 @@ mod tests {
         let mut state = SyncState::new();
         let peer = PeerId::random();
 
-        state.start_pull(Path::new("."), peer, "/file1.txt".to_string(), None, EventKind::Created, "user".to_string());
-        let req2 = state.start_pull(Path::new("."), peer, "/file2.txt".to_string(), None, EventKind::Created, "user".to_string());
+        state.start_pull(
+            Path::new("."),
+            peer,
+            "/file1.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
+        let req2 = state.start_pull(
+            Path::new("."),
+            peer,
+            "/file2.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
 
         assert!(req2.is_none()); // Second transfer queued
         assert_eq!(state.queued_pulls.len(), 1);
@@ -1067,8 +1149,22 @@ mod tests {
         let mut state = SyncState::new();
         let peer = PeerId::random();
 
-        state.start_pull(Path::new("."), peer, "/file1.txt".to_string(), None, EventKind::Created, "user".to_string());
-        state.start_pull(Path::new("."), peer, "/file2.txt".to_string(), None, EventKind::Created, "user".to_string());
+        state.start_pull(
+            Path::new("."),
+            peer,
+            "/file1.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
+        state.start_pull(
+            Path::new("."),
+            peer,
+            "/file2.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
 
         let next = state.finish_transfer(peer, "/file1.txt");
         assert!(next.is_some());
@@ -1081,10 +1177,27 @@ mod tests {
         let peer1 = PeerId::random();
         let peer2 = PeerId::random();
 
-        state.start_pull(Path::new("."), peer1, "/file1.txt".to_string(), None, EventKind::Created, "user".to_string());
-        state.start_pull(Path::new("."), peer2, "/file2.txt".to_string(), None, EventKind::Created, "user".to_string());
+        state.start_pull(
+            Path::new("."),
+            peer1,
+            "/file1.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
+        state.start_pull(
+            Path::new("."),
+            peer2,
+            "/file2.txt".to_string(),
+            None,
+            EventKind::Created,
+            "user".to_string(),
+        );
 
-        let next = tokio::runtime::Runtime::new().unwrap().block_on(state.cancel_peer(peer1)).unwrap();
+        let next = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(state.cancel_peer(peer1))
+            .unwrap();
         assert!(next.is_some()); // peer2's transfer should start
         assert!(!state.is_pending(peer1, "/file1.txt"));
         assert!(state.is_pending(peer2, "/file2.txt"));
