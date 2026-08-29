@@ -353,7 +353,6 @@ pub async fn run_discovery(
                                     &data_dir,
                                     &database,
                                     &mut sync_state,
-                                    peer,
                                     path,
                                     data,
                                     offset,

@@ -222,11 +222,14 @@ impl SyncState {
             })
         } else {
             // Queue it
+            let waiting_for = self
+                .current_transfer
+                .as_ref()
+                .map(|t| t.params.resource_path.clone())
+                .unwrap_or_default();
             println!(
                 "sync: queue pull for {} from peer {} (waiting for {})",
-                resource_path,
-                peer,
-                self.current_transfer.as_ref().unwrap().params.resource_path
+                resource_path, peer, waiting_for
             );
             self.queued_pulls.push_back(QueuedPullParams {
                 peer,
@@ -663,10 +666,10 @@ pub fn diff_manifests(local: &Manifest, remote: &Manifest) -> Vec<SyncAction> {
                 resource_kind,
                 checksum: _,
             } if resource_kind == "deleted" => {
-                if let Some((_, PathState { resource_kind, .. })) = local_states.get(path) {
-                    if resource_kind != "deleted" {
-                        actions.push(SyncAction::Delete { path: path.clone() });
-                    }
+                if let Some((_, PathState { resource_kind, .. })) = local_states.get(path)
+                    && resource_kind != "deleted"
+                {
+                    actions.push(SyncAction::Delete { path: path.clone() });
                 }
             }
             PathState {
@@ -886,7 +889,6 @@ pub async fn handle_file_chunk(
     data_dir: &Path,
     database: &Database,
     state: &mut SyncState,
-    _peer: PeerId,
     path: String,
     data: Vec<u8>,
     offset: u64,

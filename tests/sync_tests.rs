@@ -519,7 +519,6 @@ async fn handle_file_start_and_chunk_writes_file_and_verifies_checksum() {
         &data_dir,
         &database,
         &mut state,
-        peer,
         "/incoming.txt".to_string(),
         content.to_vec(),
         0,
@@ -551,7 +550,7 @@ async fn handle_file_chunk_discards_on_checksum_mismatch() {
     let mut state = SyncState::new();
 
     let content = b"tampered content";
-    let checksum = crc32_hex(content);
+    let _checksum = crc32_hex(content);
 
     // Start a pull with wrong expected checksum
     state.start_pull(
@@ -582,7 +581,6 @@ async fn handle_file_chunk_discards_on_checksum_mismatch() {
         &data_dir,
         &database,
         &mut state,
-        peer,
         "/bad.txt".to_string(),
         content.to_vec(),
         0,
@@ -596,11 +594,10 @@ async fn handle_file_chunk_discards_on_checksum_mismatch() {
     // After checksum mismatch, it should retry (up to 3 times)
     // Each call retries - after 3 retries it gives up
     for _ in 0..3 {
-        let next = handle_file_chunk(
+        let _next = handle_file_chunk(
             &data_dir,
             &database,
             &mut state,
-            peer,
             "/bad.txt".to_string(),
             content.to_vec(),
             0,
@@ -678,7 +675,7 @@ async fn serial_mode_queues_multiple_pulls_fifo() {
     let data_dir = temp_dir("sync-serial-fifo-data");
     fs::create_dir_all(&data_dir).expect("data dir should be created");
 
-    let database = Database::open(&sqlite_dir, &data_dir)
+    let _database = Database::open(&sqlite_dir, &data_dir)
         .await
         .expect("database should open");
 
@@ -756,7 +753,7 @@ async fn cancel_peer_removes_queued_transfers() {
     let data_dir = temp_dir("sync-cancel-peer-data");
     fs::create_dir_all(&data_dir).expect("data dir should be created");
 
-    let database = Database::open(&sqlite_dir, &data_dir)
+    let _database = Database::open(&sqlite_dir, &data_dir)
         .await
         .expect("database should open");
 
