@@ -16,12 +16,12 @@
 │   ├── db.rs                # SQLite persistence layer and background worker
 │   ├── webdav.rs            # WebDAV server implementation
 │   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
-│   ├── sync.rs              # P2P file replication protocol and reconciliation
+│   ├── sync.rs              # P2P file replication protocol (serial chunked transfers)
 │   └── lib.rs               # Library exports and shared functionality
 ├── tests/
 │   ├── webdav_tests.rs      # WebDAV helper tests
 │   ├── db_tests.rs          # SQLite persistence integration tests
-│   └── p2p_tests.rs         # P2P discovery and peer tests
+│   ├── p2p_tests.rs         # P2P discovery and peer tests
 │   └── sync_tests.rs        # P2P sync protocol tests
 ├── Cargo.toml               # Dependencies & package configuration
 ├── AGENTS.md                # Agent project information ✅
@@ -59,8 +59,10 @@
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
 ✅ P2P Sync Protocol: request-response CBOR under /nacs-backend/sync/1 (wire format unchanged and backwards compatible)
-✅ P2P Sync Chunking: default 4 MiB pull-based file transfers with CRC32 checksum verification, configurable via SYNC_CHUNK_SIZE_BYTES (note: the libp2p CBOR codec limits responses to 10 MiB by default; larger chunks need a custom codec limit)
-✅ P2P Sync Pipelining: up to SYNC_WINDOW_REQUESTS chunk requests in flight per transfer (default 4); out-of-order responses are reordered before writing; memory bound per transfer ≈ window × chunk size
+✅ P2P Sync: Serial chunked transfers - one file at a time globally, FIFO queue, 1 MiB chunks streamed; CRC32 checksum verification
+✅ Sync Request Timeout: 30 minutes (1800s) for large file transfers
+✅ Idle Connection Timeout: 5 minutes (300s) to allow slow chunk transfers
+✅ Max Response Size: 200 MB
 ✅ Swarm Idle Timeout: 60 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
@@ -139,12 +141,14 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Discovery:** mDNS for automatic peer detection on LAN
 - **Identity:** Persistent peer identity stored in `./sqlite/p2p_identity.key`
 - **Port:** Configurable via `P2P_PORT` env var, defaults to 4001
-- **Chunk size:** Configurable via `SYNC_CHUNK_SIZE_BYTES`, defaults to 4194304 bytes (4 MiB); invalid values warn and fall back to default
-- **Request window:** Configurable via `SYNC_WINDOW_REQUESTS`, defaults to 4 in-flight chunk requests per transfer; invalid values warn and fall back to default
-- **Request timeout:** 60 s per sync request; failed chunk requests are retried up to 3 times before the transfer is aborted
+- **Sync mode:** Serial chunked - one file at a time globally, FIFO queue, 1 MiB chunks streamed; CRC32 checksum verification
+- **Request timeout:** 30 minutes (1800s) for large file transfers
+- **Idle connection timeout:** 5 minutes (300s) to allow slow chunk transfers
+- **Max response size:** 200 MB
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
 - **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
+- **Retry logic:** Up to 3 retries per transfer on checksum mismatch or failure before moving to next queued file
 
 ---
 
@@ -160,8 +164,6 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | **Sync tests** | `cargo test --test sync_tests` |
 | **All tests** | `cargo test --all` |
 | **Set P2P Port** | `P2P_PORT=5001 cargo run` |
-| **Set sync chunk size** | `SYNC_CHUNK_SIZE_BYTES=8388608 cargo run` |
-| **Set sync window** | `SYNC_WINDOW_REQUESTS=8 cargo run` |
 
 ---
 
@@ -177,9 +179,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-08-13 (sync pipelining: sliding-window chunk requests, incremental checksums, sender-side file handle cache, retry/timeout hardening) |
+| **Last Updated** | 2026-08-29 (serial chunked sync: 1 MiB chunks, FIFO queue, one file at a time, 30min timeout, 5min idle timeout, 3 retries) |
 | **Status** | ✅ Active project info for future interactions |
-| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and file sync implemented |
+| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and serial chunked file sync implemented |
 
 ---
 

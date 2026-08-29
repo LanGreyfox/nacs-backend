@@ -275,19 +275,19 @@ fn build_manifest(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Manife
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|(resource_path, resource_kind, checksum, updated_at)| {
+        .filter_map(|(resource_path, resource_kind, checksum, updated_at)| {
             let size = if resource_kind == "folder" {
                 0
             } else {
-                file_size(data_dir, &resource_path).unwrap_or(0)
+                file_size(data_dir, &resource_path).ok()?
             };
-            ManifestEntry {
+            Some(ManifestEntry {
                 resource_path,
                 resource_kind,
                 checksum,
                 size,
                 updated_at,
-            }
+            })
         })
         .collect();
 
