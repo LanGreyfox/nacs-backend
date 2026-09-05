@@ -5,11 +5,11 @@ use std::{
 };
 
 use hyper::{Method, StatusCode};
+use nacs_backend::auth::{build_unauthorized_response, parse_basic_credentials};
 use nacs_backend::db::{Database, EventKind};
 use nacs_backend::sync::P2pHandle;
 use nacs_backend::webdav::{
-    FileEvent, SpawnP2pAnnouncementParams, build_unauthorized_response, ensure_data_dir,
-    map_to_event, parse_basic_credentials, spawn_p2p_announcement,
+    FileEvent, SpawnP2pAnnouncementParams, ensure_data_dir, map_to_event, spawn_p2p_announcement,
 };
 
 fn temp_dir(name: &str) -> PathBuf {

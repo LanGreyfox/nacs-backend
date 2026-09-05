@@ -5,17 +5,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::auth::{build_unauthorized_response, is_authorized, parse_basic_credentials};
 use crate::db::{Database, EventEnvelope, EventKind, file_checksum_and_size};
 use crate::sync::{FileChangeEvent, P2pHandle};
-use dav_server::body::Body;
 use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
-use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, USER_AGENT, WWW_AUTHENTICATE};
-use hyper::{
-    Method, Response, StatusCode, Uri, header::HeaderMap, server::conn::http1, service::service_fn,
-};
-// use dav_server::Body for response bodies (imported above)
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use hyper::header::{AUTHORIZATION, USER_AGENT};
+use hyper::{Method, StatusCode, Uri, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
@@ -28,46 +23,6 @@ pub fn build_handler(dir: impl AsRef<Path>) -> DavHandler {
         .filesystem(LocalFs::new(dir.as_ref(), false, false, false))
         .locksystem(FakeLs::new())
         .build_handler()
-}
-
-pub fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
-    let mut parts = value.split_whitespace();
-    let scheme = parts.next()?;
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return None;
-    }
-
-    let token = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-
-    let decoded = STANDARD.decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    let (username, password) = decoded.split_once(':')?;
-    Some((username.to_string(), password.to_string()))
-}
-
-fn method_allows_unauthenticated(method: &Method) -> bool {
-    method.as_str() == "OPTIONS"
-}
-
-fn is_authorized(
-    headers: &HeaderMap,
-    expected_user: &str,
-    expected_pass: &str,
-    method: &Method,
-) -> bool {
-    if method_allows_unauthenticated(method) {
-        return true;
-    }
-
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_basic_credentials)
-        .map(|(u, p)| u == expected_user && p == expected_pass)
-        .unwrap_or(false)
 }
 
 /// Semantic file event derived from a WebDAV HTTP method and its response status code.
@@ -285,30 +240,6 @@ pub fn log_file_event(
     } else {
         println!("{line}");
     }
-}
-
-pub fn build_unauthorized_response(method: &Method) -> Response<Body> {
-    // Dolphin/KIO expects a strict challenge response and
-    // benefits from DAV capability headers on preflight OPTIONS.
-    let mut builder = Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(
-            WWW_AUTHENTICATE,
-            "Basic realm=\"webdav\", charset=\"UTF-8\"",
-        )
-        .header(CONTENT_LENGTH, "0");
-
-    if method.as_str() == "OPTIONS" {
-        builder = builder
-            .header("DAV", "1,2")
-            .header("MS-Author-Via", "DAV")
-            .header(
-                "Allow",
-                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK",
-            );
-    }
-
-    builder.body(Body::empty()).unwrap()
 }
 
 fn event_kind_for_storage(event: &FileEvent) -> Option<EventKind> {

@@ -104,6 +104,17 @@ pub enum SyncAction {
     Delete { path: String },
 }
 
+/// Information about an in-progress file transfer for the REST API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransferInfo {
+    pub path: String,
+    pub peer_id: String,
+    pub event_kind: String,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub username: String,
+}
+
 /// Parameters for a queued pull operation.
 #[derive(Debug, Clone)]
 struct QueuedPullParams {
@@ -177,6 +188,18 @@ impl SyncState {
         self.current_transfer
             .as_ref()
             .map(|p| p.params.resource_path.clone())
+    }
+
+    /// Returns detailed info about the current transfer, if any.
+    pub fn get_transfer_info(&self) -> Option<TransferInfo> {
+        self.current_transfer.as_ref().map(|t| TransferInfo {
+            path: t.params.resource_path.clone(),
+            peer_id: t.params.peer.to_string(),
+            event_kind: t.params.event_kind.as_str().to_string(),
+            progress_bytes: t.next_chunk_offset,
+            total_bytes: t.total_size,
+            username: t.params.username.clone(),
+        })
     }
 
     /// Starts a pull if idle, otherwise queues it.

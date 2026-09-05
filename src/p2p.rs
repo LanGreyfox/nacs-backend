@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     error::Error,
     io,
     path::{Path, PathBuf},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use libp2p::{
@@ -24,10 +24,55 @@ use libp2p::{
     },
     tcp, yamux,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::db::Database;
 use crate::sync::{self, FileChangeEvent, SyncRequest, SyncResponse, SyncState};
+
+/// Query types for the P2P worker to expose status to the REST API.
+#[derive(Debug)]
+pub enum P2pQuery {
+    GetStatus(oneshot::Sender<P2pStatus>),
+    GetPeers(oneshot::Sender<Vec<PeerInfo>>),
+}
+
+/// Current sync status for the REST API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct P2pStatus {
+    pub is_syncing: bool,
+    pub current_transfer: Option<P2pTransferInfo>,
+    pub queue_length: usize,
+    pub peers_connected: usize,
+}
+
+/// Information about an in-progress file transfer (P2P version for API).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct P2pTransferInfo {
+    pub path: String,
+    pub peer_id: String,
+    pub event_kind: String,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub username: String,
+}
+
+/// Information about a connected peer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub connected_since: SystemTime,
+    pub addresses: Vec<String>,
+    pub last_heartbeat: SystemTime,
+    pub is_synced: bool,
+}
+
+struct PeerConnectionInfo {
+    peer_id: PeerId,
+    connected_since: SystemTime,
+    addresses: Vec<String>,
+    last_heartbeat: SystemTime,
+    has_synced: bool,
+}
 
 const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
@@ -157,6 +202,7 @@ pub async fn run_discovery(
     data_dir: impl AsRef<Path>,
     database: Database,
     mut announce_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
+    mut query_rx: mpsc::Receiver<P2pQuery>,
 ) -> io::Result<()> {
     let data_dir = data_dir.as_ref().to_path_buf();
     let listen_port = configured_peer_port()?;
@@ -221,6 +267,7 @@ pub async fn run_discovery(
     let mut connected_peers = HashSet::new();
     let mut dialing_peers = HashSet::new();
     let mut sync_state = SyncState::new();
+    let mut peer_info: HashMap<PeerId, PeerConnectionInfo> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -270,11 +317,15 @@ pub async fn run_discovery(
                         match result {
                             Ok(rtt) => {
                                 println!("heartbeat ok: {peer} rtt={rtt:?}");
+                                if let Some(info) = peer_info.get_mut(&peer) {
+                                    info.last_heartbeat = SystemTime::now();
+                                }
                             }
                             Err(err) => {
                                 connected_peers.remove(&peer);
                                 dialing_peers.remove(&peer);
                                 seen_peers.insert(peer);
+                                peer_info.remove(&peer);
                                 eprintln!("peer unreachable (heartbeat failed): {peer}: {err}");
                             }
                         }
@@ -286,6 +337,10 @@ pub async fn run_discovery(
                     })) => match message {
                         request_response::Message::Request { request, channel, .. } => match request {
                             SyncRequest::Manifest => {
+                                // Mark peer as synced when they request our manifest
+                                if let Some(info) = peer_info.get_mut(&peer) {
+                                    info.has_synced = true;
+                                }
                                 let response = match database.manifest().await {
                                     Ok(manifest) => SyncResponse::Manifest(manifest),
                                     Err(err) => {
@@ -319,6 +374,10 @@ pub async fn run_discovery(
                         request_response::Message::Response { response, .. } => match response {
                             SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
                                 Ok(local_manifest) => {
+                                    // Mark peer as synced after successful manifest exchange
+                                    if let Some(info) = peer_info.get_mut(&peer) {
+                                        info.has_synced = true;
+                                    }
                                     let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
                                     let fetch_requests = sync::apply_manifest_actions(
                                         &data_dir,
@@ -400,6 +459,7 @@ pub async fn run_discovery(
                         connected_peers.remove(&peer_id);
                         dialing_peers.remove(&peer_id);
                         seen_peers.insert(peer_id);
+                        peer_info.remove(&peer_id);
                         if let Err(err) = sync_state.cancel_peer(peer_id).await {
                             eprintln!("failed to cancel pending sync transfers for {peer_id}: {err}");
                         }
@@ -428,6 +488,17 @@ pub async fn run_discovery(
                         connected_peers.insert(peer_id);
                         dialing_peers.remove(&peer_id);
                         seen_peers.insert(peer_id);
+                        // Track peer connection info
+                        let now = SystemTime::now();
+                        let remote_addr = endpoint.get_remote_address().clone();
+                        let addresses = vec![remote_addr.to_string()];
+                        peer_info.insert(peer_id, PeerConnectionInfo {
+                            peer_id,
+                            connected_since: now,
+                            addresses,
+                            last_heartbeat: now,
+                            has_synced: false,
+                        });
                         println!("peer connected: {peer_id} via {endpoint:?}");
                         // Kick off initial reconciliation with the newly (re)connected peer.
                         swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
@@ -455,6 +526,41 @@ pub async fn run_discovery(
                         .behaviour_mut()
                         .sync
                         .send_request(peer, SyncRequest::Event(change_event.clone()));
+                }
+            }
+            Some(query) = query_rx.recv() => {
+                match query {
+                    P2pQuery::GetStatus(reply_tx) => {
+                        let current_transfer = sync_state.get_transfer_info().map(|t| P2pTransferInfo {
+                            path: t.path,
+                            peer_id: t.peer_id.to_string(),
+                            event_kind: t.event_kind.as_str().to_string(),
+                            progress_bytes: t.progress_bytes,
+                            total_bytes: t.total_bytes,
+                            username: t.username,
+                        });
+                        let status = P2pStatus {
+                            is_syncing: sync_state.is_busy(),
+                            current_transfer,
+                            queue_length: sync_state.queue_len(),
+                            peers_connected: connected_peers.len(),
+                        };
+                        let _ = reply_tx.send(status);
+                    }
+                    P2pQuery::GetPeers(reply_tx) => {
+                        let peers: Vec<PeerInfo> = peer_info
+                            .values()
+                            .filter(|info| connected_peers.contains(&info.peer_id))
+                            .map(|info| PeerInfo {
+                                peer_id: info.peer_id.to_string(),
+                                connected_since: info.connected_since,
+                                addresses: info.addresses.iter().map(|a| a.to_string()).collect(),
+                                last_heartbeat: info.last_heartbeat,
+                                is_synced: info.has_synced,
+                            })
+                            .collect();
+                        let _ = reply_tx.send(peers);
+                    }
                 }
             }
         }
