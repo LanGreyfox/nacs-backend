@@ -319,21 +319,25 @@ fn parse_timestamp(ts: &str) -> DateTime<Utc> {
 }
 
 pub async fn run_server(addr: SocketAddr, state: ApiState) {
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    info!("REST API listening on http://{}", addr);
+    axum::serve(listener, app).await.unwrap();
+}
+
+pub fn build_router(state: ApiState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/peers", get(peers_handler))
         .route("/api/v1/files", get(files_handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(Arc::new(state));
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    info!("REST API listening on http://{}", addr);
-    axum::serve(listener, app).await.unwrap();
+        .with_state(Arc::new(state))
 }
