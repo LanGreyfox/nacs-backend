@@ -13,6 +13,7 @@ transfers file contents using **serial chunked pull-based requests** (one file a
 ## Project layout
 
 - `src/main.rs` — binary entry point and startup wiring
+- `src/api.rs` — REST monitoring API for health, sync status, peers, and file manifests
 - `src/webdav.rs` — WebDAV request handling, auth, and event mapping
 - `src/db.rs` — SQLite persistence layer and background worker
 - `src/p2p.rs` — libp2p discovery, heartbeat, and peer connection lifecycle
@@ -24,7 +25,8 @@ transfers file contents using **serial chunked pull-based requests** (one file a
 
 ## Default configuration
 
-- Default listening address: `127.0.0.1:4918`
+- Default WebDAV listening address: `127.0.0.1:4918`
+- Default REST API listening address: `127.0.0.1:3000`
 - Default P2P listening port: `4001`
 - Data directory: `./data` (created automatically)
 - SQLite directory: `./sqlite` (created automatically)
@@ -35,8 +37,10 @@ By default port `4001` uses `./sqlite/p2p_identity.key`; other P2P ports use `./
 
 You can override host and port with environment variables:
 
-- `WEBDAV_HOST` — bind host/IP (default: `127.0.0.1`)
-- `WEBDAV_PORT` — bind port (default: `4918`)
+- `WEBDAV_HOST` — bind host/IP for the WebDAV server (default: `127.0.0.1`)
+- `WEBDAV_PORT` — WebDAV bind port (default: `4918`)
+- `API_HOST` — bind host/IP for the REST API (default: `127.0.0.1`)
+- `API_PORT` — REST API bind port (default: `3000`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
 
 **Sync configuration (hardcoded defaults):**
@@ -56,6 +60,56 @@ This server enforces HTTP Basic Authentication for WebDAV requests. Credentials 
 The server expects these variables to be set; it exits with an error if either is missing.
 
 The server allows unauthenticated `OPTIONS` requests, while all other WebDAV methods require Basic Authentication.
+
+## REST API
+
+The service starts a second HTTP listener for monitoring and inspection. This REST API is independent from the WebDAV endpoint and is used to check peer state, sync status, and the current manifest.
+
+### Authentication
+
+The REST API uses the same Basic Auth credentials as the WebDAV backend:
+
+- `WEBDAV_USER`
+- `WEBDAV_PASS`
+
+The `/health` route is public. All other API routes require Basic Auth.
+
+### Endpoints
+
+- `GET /health` — returns service health, version, and uptime.
+- `GET /api/v1/status` — exposes current sync status and active transfer details.
+- `GET /api/v1/peers` — lists connected peers with pagination support (`limit`, `offset`).
+- `GET /api/v1/files` — lists the current manifest and tombstones with optional filters (`limit`, `offset`, `kind`, `path_prefix`).
+
+Example responses:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime_seconds": 123
+}
+```
+
+```json
+{
+  "sync": {
+    "is_active": true,
+    "current_transfer": {
+      "path": "example.bin",
+      "peer_id": "12D3KooW...",
+      "event_kind": "create",
+      "progress_bytes": 524288,
+      "total_bytes": 1048576,
+      "username": "alice"
+    },
+    "queue_length": 2
+  },
+  "peers_connected": 3
+}
+```
+
+The API is started from `main.rs` alongside the WebDAV server, and it queries the P2P worker to surface the active status without exposing direct P2P internals to the WebDAV layer.
 
 ## Persistence
 
@@ -105,6 +159,8 @@ export WEBDAV_USER="youruser"
 export WEBDAV_PASS="yourpassword"
 export WEBDAV_HOST="127.0.0.1"
 export WEBDAV_PORT="4918"
+export API_HOST="127.0.0.1"
+export API_PORT="3000"
 export P2P_PORT="4001"
 cargo run
 ```
