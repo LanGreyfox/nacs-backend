@@ -49,9 +49,12 @@ async fn health_handler() -> impl IntoResponse {
     })
 }
 
-fn check_auth(headers: &HeaderMap, state: &ApiState) -> Result<(), StatusCode> {
-    let method = axum::http::Method::GET;
-    if is_authorized(headers, &state.auth_user, &state.auth_pass, &method) {
+fn check_auth(
+    headers: &HeaderMap,
+    state: &ApiState,
+    method: &axum::http::Method,
+) -> Result<(), StatusCode> {
+    if is_authorized(headers, &state.auth_user, &state.auth_pass, method) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -96,9 +99,10 @@ impl From<P2pTransferInfo> for TransferInfoResponse {
 
 async fn status_handler(
     State(state): State<Arc<ApiState>>,
+    method: axum::http::Method,
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state, &method)?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -162,10 +166,11 @@ struct PaginationResponse {
 
 async fn peers_handler(
     State(state): State<Arc<ApiState>>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Query(params): Query<PeersQuery>,
 ) -> Result<Json<PeersResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state, &method)?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -230,10 +235,11 @@ struct FilesQuery {
 
 async fn files_handler(
     State(state): State<Arc<ApiState>>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Query(params): Query<FilesQuery>,
 ) -> Result<Json<FilesResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state, &method)?;
 
     let manifest = state
         .database
@@ -292,7 +298,14 @@ async fn files_handler(
 
     let resources_paginated: Vec<_> = resources.into_iter().skip(offset).take(limit).collect();
     let remaining_limit = limit.saturating_sub(resources_paginated.len());
-    let tombstones_paginated: Vec<_> = tombstones.into_iter().take(remaining_limit).collect();
+    // Global offset applies across resources + tombstones (resources first).
+    // Without this, an offset beyond all resources would still return the first tombstones.
+    let tombstone_offset = offset.saturating_sub(total_resources);
+    let tombstones_paginated: Vec<_> = tombstones
+        .into_iter()
+        .skip(tombstone_offset)
+        .take(remaining_limit)
+        .collect();
 
     let has_more = offset + limit < total;
 
@@ -309,13 +322,24 @@ async fn files_handler(
 }
 
 fn parse_timestamp(ts: &str) -> DateTime<Utc> {
+    // 1) Nanoseconds since epoch (written by db::updated_at_for_path).
     if let Ok(nanos) = ts.parse::<u128>() {
         let secs = (nanos / 1_000_000_000) as i64;
         let nsecs = (nanos % 1_000_000_000) as u32;
-        DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now)
-    } else {
-        Utc::now()
+        if let Some(dt) = DateTime::from_timestamp(secs, nsecs) {
+            return dt;
+        }
     }
+    // 2) SQLite CURRENT_TIMESTAMP used for archived_at/deleted_at: "YYYY-MM-DD HH:MM:SS" (UTC).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+        return naive.and_utc();
+    }
+    // 3) RFC 3339 / ISO 8601 fallback.
+    if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
+        return dt;
+    }
+    // Never return `now()` here: that would silently mask corrupt timestamps.
+    DateTime::UNIX_EPOCH
 }
 
 pub async fn run_server(addr: SocketAddr, state: ApiState) {
