@@ -5,7 +5,7 @@
 |-----------|-------|
 | **Language** | Rust |
 | **Version** | 0.1.0 |
-| **Primary Function** | WebDAV Server with P2P Discovery and file sync based on `dav-server` and `libp2p` |
+| **Primary Function** | WebDAV server with P2P discovery, file sync, and a monitoring REST API based on `dav-server`, `libp2p`, and `axum` |
 
 ---
 
@@ -13,6 +13,7 @@
 ```text
 ├── src/
 │   ├── main.rs              # Binary entry point and startup wiring
+│   ├── api.rs               # REST monitoring API: health, sync status, peers, and file manifest endpoints
 │   ├── db.rs                # SQLite persistence layer and background worker
 │   ├── webdav.rs            # WebDAV server implementation
 │   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
@@ -48,6 +49,7 @@
 ## ⚙️ Configuration Summary
 ```
 ✅ Default WebDAV Port: http://127.0.0.1:4918
+✅ Default REST API Port: http://127.0.0.1:3000
 ✅ Default P2P Port: 4001
 ✅ Data Directory: ./data (auto-created)
 ✅ SQLite Directory: ./sqlite (auto-created)
@@ -55,6 +57,8 @@
 ✅ P2P Identity File: ./sqlite/p2p_identity.key for port 4001; ./sqlite/p2p_identity-<port>.key for other P2P ports (auto-created)
 ✅ Lock System: FakeLs (for simple tests)
 ✅ WebDAV Auth: HTTP Basic Auth with WEBDAV_USER / WEBDAV_PASS
+✅ REST API Auth: same Basic Auth credentials as WebDAV, with /health publicly readable
+✅ REST API Endpoints: /health, /api/v1/status, /api/v1/peers, /api/v1/files
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
@@ -72,11 +76,13 @@
 
 ## 🎯 Core Features Checklist
 - [x] WebDAV HTTP Server
+- [x] REST monitoring API with axum
 - [x] Local filesystem support (`LocalFs`)
 - [x] Async event loop with Tokio
 - [x] Auto-creation of data directories
 - [x] SQLite persistence with background worker
 - [x] WebDAV Basic Auth enforcement
+- [x] REST API Basic Auth enforcement for protected routes with public /health endpoint
 - [x] P2P peer discovery with libp2p (mDNS)
 - [x] Encrypted P2P transport (Noise + Yamux)
 - [x] P2P identity management and persistence
@@ -111,6 +117,17 @@ let dav_server = DavHandler::builder()
     .locksystem(FakeLs::new())
     .build_handler();
 ```
+
+### REST API Bootstrapping
+```rust
+let api_host = std::env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+let api_port: u16 = std::env::var("API_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);
+let api_addr: SocketAddr = format!("{api_host}:{api_port}").parse().expect("Invalid API_HOST/API_PORT combination");
+
+tokio::spawn(api::run_server(api_addr, api_state));
+```
+
+The API exposes `/health`, `/api/v1/status`, `/api/v1/peers`, and `/api/v1/files` and reuses the same WebDAV credentials for protected routes.
 
 ### SQLite Event Persistence
 ```rust
@@ -158,6 +175,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 |--------|---------|
 | **Build** | `cargo build --release` |
 | **Run** | `cargo run` or `target/release/nacs-backend` |
+| **API port override** | `API_PORT=3100 cargo run` |
 | **Tests** | `cargo test` |
 | **DB tests** | `cargo test --test db_tests` |
 | **P2P tests** | `cargo test --test p2p_tests` |
@@ -179,9 +197,9 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 | Field | Value |
 |-------|-------|
 | **Created** | Automatically for agent project context |
-| **Last Updated** | 2026-08-29 (serial chunked sync: 1 MiB chunks, FIFO queue, one file at a time, 30min timeout, 5min idle timeout, 3 retries) |
+| **Last Updated** | 2026-09-07 (added the monitoring REST API: /health, /api/v1/status, /api/v1/peers, /api/v1/files and API_HOST/API_PORT config) |
 | **Status** | ✅ Active project info for future interactions |
-| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, and serial chunked file sync implemented |
+| **P2P Status** | ✅ Peer discovery, keepalive, heartbeat, dial guards, serial chunked file sync, and REST monitoring API implemented |
 
 ---
 
