@@ -59,6 +59,7 @@
 ✅ WebDAV Auth: HTTP Basic Auth with WEBDAV_USER / WEBDAV_PASS
 ✅ REST API Auth: same Basic Auth credentials as WebDAV, with /health publicly readable
 ✅ REST API Endpoints: /health, /api/v1/status, /api/v1/peers, /api/v1/files
+✅ Web UI: static Vue build served from WEB_DIR (default ./web, copy dist/ contents there) on the REST API port, SPA fallback to index.html, public; disabled if index.html is missing
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet

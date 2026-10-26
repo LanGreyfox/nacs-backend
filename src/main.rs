@@ -64,7 +64,16 @@ async fn run() -> std::io::Result<()> {
         auth_user: username.clone(),
         auth_pass: password.clone(),
     };
-    tokio::spawn(api::run_server(api_addr, api_state));
+    let web_dir = std::path::PathBuf::from(
+        std::env::var("WEB_DIR").unwrap_or_else(|_| "./web".to_string()),
+    );
+    let web_dir = if web_dir.join("index.html").is_file() {
+        Some(web_dir)
+    } else {
+        eprintln!("No index.html in {}; web UI disabled", web_dir.display());
+        None
+    };
+    tokio::spawn(api::run_server(api_addr, api_state, web_dir));
 
     webdav::run_server(addr, dir, database, p2p_handle).await
 }
