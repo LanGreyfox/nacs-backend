@@ -263,14 +263,26 @@ pub async fn run_discovery(
         )
         .map_err(io::Error::other)?;
 
-    let mut seen_peers = HashSet::new();
+    let mut discovered_peers = HashSet::new();
     let mut connected_peers = HashSet::new();
     let mut dialing_peers = HashSet::new();
     let mut sync_state = SyncState::new();
     let mut peer_info: HashMap<PeerId, PeerConnectionInfo> = HashMap::new();
+    let mut reconnect_interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
+            _ = reconnect_interval.tick() => {
+                for peer_id in peers_requiring_dial(&discovered_peers, &connected_peers, &dialing_peers) {
+                    match swarm.dial(peer_id) {
+                        Ok(()) => {
+                            dialing_peers.insert(peer_id);
+                            println!("retrying connection to discovered peer: {peer_id}");
+                        }
+                        Err(err) => eprintln!("failed to retry discovered peer {peer_id}: {err}"),
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -288,27 +300,21 @@ pub async fn run_discovery(
                                 continue;
                             }
 
-                            if seen_peers.insert(peer_id) {
-                                match swarm.dial(peer_id) {
-                                    Ok(()) => {
-                                        dialing_peers.insert(peer_id);
-                                        println!("dialing peer: {peer_id} (discovered at {peer_addr})");
-                                    }
-                                    Err(err) => {
-                                        eprintln!("failed to dial discovered peer {peer_id}: {err}");
-                                    }
+                            discovered_peers.insert(peer_id);
+                            match swarm.dial(peer_id) {
+                                Ok(()) => {
+                                    dialing_peers.insert(peer_id);
+                                    println!("dialing peer: {peer_id} (discovered at {peer_addr})");
+                                }
+                                Err(err) => {
+                                    eprintln!("failed to dial discovered peer {peer_id}: {err}");
                                 }
                             }
                         }
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                         for (peer_id, _) in peers {
-                            if connected_peers.contains(&peer_id) {
-                                continue;
-                            }
-
-                            dialing_peers.remove(&peer_id);
-                            if seen_peers.remove(&peer_id) {
+                            if discovered_peers.remove(&peer_id) {
                                 eprintln!("peer no longer discoverable: {peer_id}");
                             }
                         }
@@ -324,7 +330,6 @@ pub async fn run_discovery(
                             Err(err) => {
                                 connected_peers.remove(&peer);
                                 dialing_peers.remove(&peer);
-                                seen_peers.insert(peer);
                                 peer_info.remove(&peer);
                                 eprintln!("peer unreachable (heartbeat failed): {peer}: {err}");
                             }
@@ -458,7 +463,6 @@ pub async fn run_discovery(
                     } => {
                         connected_peers.remove(&peer_id);
                         dialing_peers.remove(&peer_id);
-                        seen_peers.insert(peer_id);
                         peer_info.remove(&peer_id);
                         if let Err(err) = sync_state.cancel_peer(peer_id).await {
                             eprintln!("failed to cancel pending sync transfers for {peer_id}: {err}");
@@ -487,7 +491,6 @@ pub async fn run_discovery(
                     } => {
                         connected_peers.insert(peer_id);
                         dialing_peers.remove(&peer_id);
-                        seen_peers.insert(peer_id);
                         // Track peer connection info
                         let now = SystemTime::now();
                         let remote_addr = endpoint.get_remote_address().clone();
@@ -511,7 +514,6 @@ pub async fn run_discovery(
                                     "outgoing dial failed for {peer_id}, but peer is already connected: {error}"
                                 );
                             } else {
-                                seen_peers.insert(peer_id);
                                 eprintln!("outgoing dial failed for {peer_id}: {error}");
                             }
                         }
@@ -618,4 +620,16 @@ pub fn newly_discovered_peers(
         }
     }
     new_peers
+}
+
+pub fn peers_requiring_dial(
+    discovered: &HashSet<PeerId>,
+    connected: &HashSet<PeerId>,
+    dialing: &HashSet<PeerId>,
+) -> Vec<PeerId> {
+    discovered
+        .iter()
+        .filter(|peer_id| !connected.contains(*peer_id) && !dialing.contains(*peer_id))
+        .copied()
+        .collect()
 }
