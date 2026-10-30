@@ -19,6 +19,7 @@
 │   ├── p2p.rs               # P2P peer discovery with libp2p and mDNS
 │   ├── sync.rs              # P2P file replication protocol (serial chunked transfers)
 │   └── lib.rs               # Library exports and shared functionality
+├── web/                     # Static Vue build served by the REST API
 ├── tests/
 │   ├── webdav_tests.rs      # WebDAV helper tests
 │   ├── db_tests.rs          # SQLite persistence integration tests
@@ -59,7 +60,7 @@
 ✅ WebDAV Auth: HTTP Basic Auth with WEBDAV_USER / WEBDAV_PASS
 ✅ REST API Auth: same Basic Auth credentials as WebDAV, with /health publicly readable
 ✅ REST API Endpoints: /health, /api/v1/status, /api/v1/peers, /api/v1/files
-✅ Web UI: static Vue build served from WEB_DIR (default ./web, copy dist/ contents there) on the REST API port, SPA fallback to index.html, public; disabled if index.html is missing
+✅ Web UI: static Vue build served from WEB_DIR (default ./web; place built files including index.html there) on the REST API port, public, with SPA fallback; disabled if index.html is missing
 ✅ P2P Discovery: mDNS-based peer discovery
 ✅ P2P Transport: TCP with Noise encryption & Yamux multiplexing
 ✅ P2P Security: encrypted transport, but no mutual peer authentication yet
@@ -125,10 +126,14 @@ let api_host = std::env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_strin
 let api_port: u16 = std::env::var("API_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);
 let api_addr: SocketAddr = format!("{api_host}:{api_port}").parse().expect("Invalid API_HOST/API_PORT combination");
 
-tokio::spawn(api::run_server(api_addr, api_state));
+let web_dir = std::path::PathBuf::from(
+    std::env::var("WEB_DIR").unwrap_or_else(|_| "./web".to_string()),
+);
+let web_dir = web_dir.join("index.html").is_file().then_some(web_dir);
+tokio::spawn(api::run_server(api_addr, api_state, web_dir));
 ```
 
-The API exposes `/health`, `/api/v1/status`, `/api/v1/peers`, and `/api/v1/files` and reuses the same WebDAV credentials for protected routes.
+The API exposes `/health`, `/api/v1/status`, `/api/v1/peers`, and `/api/v1/files` and reuses the same WebDAV credentials for protected routes. The optional public web UI is served on this listener; unknown client-side routes fall back to `index.html`, while unknown `/api/...` GET routes return 404.
 
 ### SQLite Event Persistence
 ```rust
@@ -165,7 +170,7 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Max response size:** 200 MB
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
 - **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
-- **Reconnect policy:** No dedicated backoff scheduler; reconnect relies on discovery/dial flow
+- **Reconnect policy:** New discoveries are dialed immediately; every 5 seconds, still-discovered peers that are neither connected nor already dialing are retried. Expired mDNS peers are removed from reconnect candidates.
 - **Retry logic:** Up to 3 retries per transfer on checksum mismatch or failure before moving to next queued file
 
 ---
