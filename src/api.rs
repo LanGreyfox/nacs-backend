@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -12,6 +13,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -342,12 +344,26 @@ fn parse_timestamp(ts: &str) -> DateTime<Utc> {
     DateTime::UNIX_EPOCH
 }
 
-pub async fn run_server(addr: SocketAddr, state: ApiState) {
-    let app = build_router(state);
+pub async fn run_server(addr: SocketAddr, state: ApiState, web_dir: Option<PathBuf>) {
+    let app = build_router_with_web(state, web_dir);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     info!("REST API listening on http://{}", addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+pub fn build_router_with_web(state: ApiState, web_dir: Option<PathBuf>) -> Router {
+    let router = build_router(state);
+    let Some(dir) = web_dir else {
+        return router;
+    };
+    // SPA fallback: unknown paths get index.html so client-side routing works.
+    let index = dir.join("index.html");
+    router.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+}
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 pub fn build_router(state: ApiState) -> Router {
@@ -361,6 +377,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/peers", get(peers_handler))
         .route("/api/v1/files", get(files_handler))
+        .route("/api/*rest", get(api_not_found))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(Arc::new(state))

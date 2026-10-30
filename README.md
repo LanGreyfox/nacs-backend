@@ -42,6 +42,7 @@ You can override host and port with environment variables:
 - `API_HOST` — bind host/IP for the REST API (default: `127.0.0.1`)
 - `API_PORT` — REST API bind port (default: `3000`)
 - `P2P_PORT` — libp2p listen port (default: `4001`)
+- `WEB_DIR` — directory containing the static web UI (default: `./web`)
 
 **Sync configuration (hardcoded defaults):**
 - Chunk size: **1 MiB** (1048576 bytes) — hardcoded in `sync.rs`, not configurable via env var
@@ -111,6 +112,12 @@ Example responses:
 
 The API is started from `main.rs` alongside the WebDAV server, and it queries the P2P worker to surface the active status without exposing direct P2P internals to the WebDAV layer.
 
+### Web UI
+
+The REST API listener also serves the static Vue web application from `WEB_DIR` (default: `./web`). Place the built frontend files, including `index.html` and its assets, directly in that directory. The web UI is served without authentication; API endpoints retain their authentication rules. Client-side routes fall back to `index.html`, while unknown `/api/...` GET routes return 404. If `index.html` is missing, the web UI is disabled and the REST API remains available.
+
+With the default API settings, open `http://127.0.0.1:3000/` to access the UI.
+
 ## Persistence
 
 WebDAV file events are written to SQLite in the background after a request has been handled.
@@ -146,8 +153,9 @@ This keeps the sync path bounded in memory and avoids eager pushes of file bytes
 Current failure/reconnect semantics:
 
 - On heartbeat failure, the peer is removed from active peer tracking immediately.
-- Failed dials and disconnects are not retried automatically.
-- Reconnect happens only when mDNS discovers the peer again.
+- Discovered peers remain eligible for reconnect attempts while mDNS continues to report them.
+- Every 5 seconds, the node retries peers that are discovered but neither connected nor already being dialed. A new mDNS discovery also starts an immediate dial attempt.
+- When mDNS reports a peer as expired, it is removed from the reconnect candidates; it can be dialed again if it is discovered later.
 - Active transfers retry up to 3 times on checksum mismatch or failure before moving to the next queued file.
 
 ## Build & Run

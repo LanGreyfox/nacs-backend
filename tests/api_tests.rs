@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nacs_backend::{
-    api::{ApiState, build_router},
+    api::{ApiState, build_router, build_router_with_web},
     db::{Database, EventEnvelope, EventKind},
     p2p::{P2pQuery, P2pStatus, P2pTransferInfo, PeerInfo},
 };
@@ -270,5 +270,57 @@ async fn p2p_channel_failure_returns_internal_server_error() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    fs::remove_dir_all(dir).expect("temporary directory should be removed");
+}
+
+#[tokio::test]
+async fn serves_static_web_with_spa_fallback_and_api_404() {
+    let (database, dir) = database("web").await;
+    let web = dir.join("web");
+    fs::create_dir_all(web.join("assets")).unwrap();
+    fs::write(web.join("index.html"), "<html>app</html>").unwrap();
+    fs::write(web.join("assets/app.js"), "console.log(1)").unwrap();
+    let (p2p_query_tx, _p2p_query_rx) = mpsc::channel(1);
+    let app = build_router_with_web(state(database, p2p_query_tx), Some(web));
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+    };
+
+    assert_eq!(get("/").await, (StatusCode::OK, "<html>app</html>".into()));
+    assert_eq!(
+        get("/assets/app.js").await,
+        (StatusCode::OK, "console.log(1)".into())
+    );
+    assert_eq!(
+        get("/some/spa/route").await,
+        (StatusCode::OK, "<html>app</html>".into())
+    );
+    assert_eq!(get("/api/v1/unknown").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get("/health").await.0, StatusCode::OK);
+    fs::remove_dir_all(dir).expect("temporary directory should be removed");
+}
+
+#[tokio::test]
+async fn without_web_dir_root_is_not_found() {
+    let (database, dir) = database("noweb").await;
+    let (p2p_query_tx, _p2p_query_rx) = mpsc::channel(1);
+    let app = build_router_with_web(state(database, p2p_query_tx), None);
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     fs::remove_dir_all(dir).expect("temporary directory should be removed");
 }

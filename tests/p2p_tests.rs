@@ -5,7 +5,7 @@ use std::{
 };
 
 use libp2p::{PeerId, identity};
-use nacs_backend::p2p::{load_or_create_identity, newly_discovered_peers};
+use nacs_backend::p2p::{load_or_create_identity, newly_discovered_peers, peers_requiring_dial};
 
 fn temp_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -67,4 +67,21 @@ fn discovery_filter_reports_peer_again_after_removal() {
 
     let rediscovered_batch = newly_discovered_peers(&mut seen, vec![peer]);
     assert_eq!(rediscovered_batch, vec![peer]);
+}
+
+#[test]
+fn reconnect_candidates_include_only_discovered_disconnected_peers() {
+    let disconnected_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+    let connected_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+    let dialing_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+    let discovered = [disconnected_peer, connected_peer, dialing_peer]
+        .into_iter()
+        .collect();
+    let connected = [connected_peer].into_iter().collect();
+    let dialing = [dialing_peer].into_iter().collect();
+
+    assert_eq!(
+        peers_requiring_dial(&discovered, &connected, &dialing),
+        vec![disconnected_peer]
+    );
 }
