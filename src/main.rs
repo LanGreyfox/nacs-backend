@@ -64,9 +64,8 @@ async fn run() -> std::io::Result<()> {
         auth_user: username.clone(),
         auth_pass: password.clone(),
     };
-    let web_dir = std::path::PathBuf::from(
-        std::env::var("WEB_DIR").unwrap_or_else(|_| "./web".to_string()),
-    );
+    let web_dir =
+        std::path::PathBuf::from(std::env::var("WEB_DIR").unwrap_or_else(|_| "./web".to_string()));
     let web_dir = if web_dir.join("index.html").is_file() {
         Some(web_dir)
     } else {
