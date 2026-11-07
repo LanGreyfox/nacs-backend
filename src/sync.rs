@@ -190,6 +190,10 @@ impl SyncState {
             .map(|p| p.params.resource_path.clone())
     }
 
+    pub fn current_transfer_peer(&self) -> Option<PeerId> {
+        self.current_transfer.as_ref().map(|p| p.params.peer)
+    }
+
     /// Returns detailed info about the current transfer, if any.
     pub fn get_transfer_info(&self) -> Option<TransferInfo> {
         self.current_transfer.as_ref().map(|t| TransferInfo {
@@ -296,7 +300,7 @@ impl SyncState {
                 total_size: 0,
                 hasher: Hasher::new(),
                 next_chunk_offset: 0,
-                file: unsafe { std::mem::zeroed() },
+                file: None,
             });
             self.current_retry = 0;
             return Some(SyncRequest::FetchFile {
@@ -332,7 +336,7 @@ impl SyncState {
                     total_size: 0,
                     hasher: Hasher::new(),
                     next_chunk_offset: 0,
-                    file: unsafe { std::mem::zeroed() },
+                    file: None,
                 });
                 self.current_retry = 0;
                 return Some(SyncRequest::FetchFile {
@@ -388,7 +392,7 @@ impl SyncState {
                     total_size: 0,
                     hasher: Hasher::new(),
                     next_chunk_offset: 0,
-                    file: unsafe { std::mem::zeroed() },
+                    file: None,
                 });
                 self.current_retry = 0;
                 return Ok(Some(SyncRequest::FetchFile {

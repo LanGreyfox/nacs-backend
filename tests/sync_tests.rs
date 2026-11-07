@@ -789,8 +789,10 @@ async fn cancel_peer_removes_queued_transfers() {
         .await
         .expect("cancel should succeed");
     assert!(next.is_some());
+    assert!(matches!(next, Some(SyncRequest::FetchFile { path }) if path == "/file2.txt"));
     assert!(!state.is_pending(peer1, "/file1.txt"));
     assert!(state.is_pending(peer2, "/file2.txt"));
+    assert_eq!(state.current_transfer_peer(), Some(peer2));
 
     fs::remove_dir_all(&sqlite_dir).ok();
     fs::remove_dir_all(&data_dir).ok();

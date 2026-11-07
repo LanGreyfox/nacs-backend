@@ -15,8 +15,8 @@ use libp2p::{
     identity, mdns, noise, ping, request_response,
     swarm::{
         ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent, ConnectionId,
-        StreamUpgradeError, SubstreamProtocol, SwarmEvent, THandler, THandlerInEvent,
-        THandlerOutEvent,
+        DialError, StreamUpgradeError, SubstreamProtocol, Swarm, SwarmEvent, THandler,
+        THandlerInEvent, THandlerOutEvent,
         behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
         handler::{
             ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
@@ -69,7 +69,7 @@ pub struct PeerInfo {
 struct PeerConnectionInfo {
     peer_id: PeerId,
     connected_since: SystemTime,
-    addresses: Vec<String>,
+    addresses: HashMap<ConnectionId, String>,
     last_heartbeat: SystemTime,
     has_synced: bool,
 }
@@ -78,6 +78,8 @@ const KEY_FILENAME: &str = "p2p_identity.key";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 8;
+const MDNS_QUERY_INTERVAL_SECS: u64 = 15;
+const MDNS_TTL_SECS: u64 = 60;
 const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300; // 5 minutes to allow slow chunk transfers
 const SYNC_REQUEST_TIMEOUT_SECS: u64 = 1800; // 30 minutes for large file transfers
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
@@ -92,7 +94,7 @@ struct DiscoveryBehaviour {
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
-// In libp2p 0.56, ping streams are intentionally ignored for keep-alive.
+// Ping streams are intentionally ignored for keep-alive.
 // This no-op behaviour keeps established connections alive while ping still
 // provides liveness checks.
 struct KeepAliveBehaviour;
@@ -224,8 +226,15 @@ pub async fn run_discovery(
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
             let keep_alive = KeepAliveBehaviour;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
+            let mdns = mdns::tokio::Behaviour::new(
+                mdns::Config {
+                    query_interval: Duration::from_secs(MDNS_QUERY_INTERVAL_SECS),
+                    ttl: Duration::from_secs(MDNS_TTL_SECS),
+                    ..Default::default()
+                },
+                peer_id,
+            )
+            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
             let ping = ping::Behaviour::new(
                 ping::Config::new()
                     .with_interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
@@ -263,9 +272,7 @@ pub async fn run_discovery(
         )
         .map_err(io::Error::other)?;
 
-    let mut discovered_peers = HashSet::new();
     let mut connected_peers = HashSet::new();
-    let mut dialing_peers = HashSet::new();
     let mut sync_state = SyncState::new();
     let mut peer_info: HashMap<PeerId, PeerConnectionInfo> = HashMap::new();
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(5));
@@ -273,14 +280,9 @@ pub async fn run_discovery(
     loop {
         tokio::select! {
             _ = reconnect_interval.tick() => {
-                for peer_id in peers_requiring_dial(&discovered_peers, &connected_peers, &dialing_peers) {
-                    match swarm.dial(peer_id) {
-                        Ok(()) => {
-                            dialing_peers.insert(peer_id);
-                            println!("retrying connection to discovered peer: {peer_id}");
-                        }
-                        Err(err) => eprintln!("failed to retry discovered peer {peer_id}: {err}"),
-                    }
+                let discovered = discovered_peer_ids(swarm.behaviour().mdns.discovered_nodes().copied(), local_peer_id);
+                for peer_id in discovered {
+                    dial_discovered_peer(&mut swarm, peer_id);
                 }
             }
             event = swarm.select_next_some() => {
@@ -296,30 +298,15 @@ pub async fn run_discovery(
 
                             println!("new node discovered: {peer_id} at {peer_addr}");
 
-                            if connected_peers.contains(&peer_id) || dialing_peers.contains(&peer_id) {
-                                continue;
-                            }
-
-                            discovered_peers.insert(peer_id);
-                            match swarm.dial(peer_id) {
-                                Ok(()) => {
-                                    dialing_peers.insert(peer_id);
-                                    println!("dialing peer: {peer_id} (discovered at {peer_addr})");
-                                }
-                                Err(err) => {
-                                    eprintln!("failed to dial discovered peer {peer_id}: {err}");
-                                }
-                            }
+                            dial_discovered_peer(&mut swarm, peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
-                        for (peer_id, _) in peers {
-                            if discovered_peers.remove(&peer_id) {
-                                eprintln!("peer no longer discoverable: {peer_id}");
-                            }
+                        for (peer_id, peer_addr) in peers {
+                            eprintln!("discovered address expired: {peer_id} at {peer_addr}");
                         }
                     }
-                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
+                    SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Ping(ping::Event { peer, connection, result })) => {
                         match result {
                             Ok(rtt) => {
                                 println!("heartbeat ok: {peer} rtt={rtt:?}");
@@ -328,10 +315,7 @@ pub async fn run_discovery(
                                 }
                             }
                             Err(err) => {
-                                connected_peers.remove(&peer);
-                                dialing_peers.remove(&peer);
-                                peer_info.remove(&peer);
-                                eprintln!("peer unreachable (heartbeat failed): {peer}: {err}");
+                                close_failed_heartbeat(&mut swarm, peer, connection, &err);
                             }
                         }
                     }
@@ -443,9 +427,13 @@ pub async fn run_discovery(
                         error,
                         ..
                     })) => {
-                        eprintln!("sync request to {peer} failed (id={request_id}): {error}; retrying");
-                        if let Some(retry_request) = sync_state.retry_current() {
-                            let _ = swarm.behaviour_mut().sync.send_request(&peer, retry_request);
+                        eprintln!("sync request to {peer} failed (id={request_id}): {error}");
+                        if swarm.is_connected(&peer)
+                            && sync_state.current_transfer_peer() == Some(peer)
+                            && let Some(retry_request) = sync_state.retry_current()
+                            && let Some(transfer_peer) = sync_state.current_transfer_peer()
+                        {
+                            swarm.behaviour_mut().sync.send_request(&transfer_peer, retry_request);
                         }
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::InboundFailure {
@@ -458,57 +446,55 @@ pub async fn run_discovery(
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::ResponseSent { .. })) => {},
                     SwarmEvent::ConnectionClosed {
                         peer_id,
+                        connection_id,
+                        num_established,
                         cause,
                         ..
                     } => {
-                        connected_peers.remove(&peer_id);
-                        dialing_peers.remove(&peer_id);
-                        peer_info.remove(&peer_id);
-                        if let Err(err) = sync_state.cancel_peer(peer_id).await {
-                            eprintln!("failed to cancel pending sync transfers for {peer_id}: {err}");
+                        if untrack_connection(&mut connected_peers, &mut peer_info, peer_id, connection_id, num_established) {
+                            match sync_state.cancel_peer(peer_id).await {
+                                Ok(Some(request)) => {
+                                    if let Some(transfer_peer) = sync_state.current_transfer_peer() {
+                                        swarm.behaviour_mut().sync.send_request(&transfer_peer, request);
+                                    } else {
+                                        eprintln!("sync: canceled peer {peer_id} but next transfer is missing");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => eprintln!("failed to cancel pending sync transfers for {peer_id}: {err}"),
+                            }
                         }
                         match cause {
                             Some(ConnectionError::KeepAliveTimeout) => {
-                                eprintln!("peer disconnected: {peer_id} (keepalive timeout expired - no protocol requested connection keep-alive)")
+                                eprintln!("connection closed for {peer_id} ({num_established} remaining): keepalive timeout")
                             }
                             Some(ConnectionError::IO(err)) => {
-                                eprintln!("peer disconnected: {peer_id} (I/O error: {err})")
+                                eprintln!("connection closed for {peer_id} ({num_established} remaining): I/O error: {err}")
                             }
-                            None => eprintln!("peer disconnected: {peer_id}"),
+                            None => eprintln!("connection closed for {peer_id} ({num_established} remaining)"),
                         }
                     }
                     SwarmEvent::Dialing { peer_id, .. } => match peer_id {
                         Some(peer_id) => {
-                            dialing_peers.insert(peer_id);
                             println!("dial started: {peer_id}")
                         }
                         None => println!("dial started: unknown peer"),
                     },
                     SwarmEvent::ConnectionEstablished {
                         peer_id,
+                        connection_id,
+                        num_established,
                         endpoint,
                         ..
                     } => {
-                        connected_peers.insert(peer_id);
-                        dialing_peers.remove(&peer_id);
-                        // Track peer connection info
-                        let now = SystemTime::now();
-                        let remote_addr = endpoint.get_remote_address().clone();
-                        let addresses = vec![remote_addr.to_string()];
-                        peer_info.insert(peer_id, PeerConnectionInfo {
-                            peer_id,
-                            connected_since: now,
-                            addresses,
-                            last_heartbeat: now,
-                            has_synced: false,
-                        });
+                        track_connection(&mut connected_peers, &mut peer_info, peer_id, connection_id, endpoint.get_remote_address().to_string());
                         println!("peer connected: {peer_id} via {endpoint:?}");
-                        // Kick off initial reconciliation with the newly (re)connected peer.
-                        swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
+                        if num_established.get() == 1 {
+                            swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::Manifest);
+                        }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
                         Some(peer_id) => {
-                            dialing_peers.remove(&peer_id);
                             if connected_peers.contains(&peer_id) {
                                 eprintln!(
                                     "outgoing dial failed for {peer_id}, but peer is already connected: {error}"
@@ -556,7 +542,7 @@ pub async fn run_discovery(
                             .map(|info| PeerInfo {
                                 peer_id: info.peer_id.to_string(),
                                 connected_since: info.connected_since,
-                                addresses: info.addresses.iter().map(|a| a.to_string()).collect(),
+                                addresses: info.addresses.values().cloned().collect(),
                                 last_heartbeat: info.last_heartbeat,
                                 is_synced: info.has_synced,
                             })
@@ -567,6 +553,77 @@ pub async fn run_discovery(
             }
         }
     }
+}
+
+fn discovered_peer_ids(
+    peers: impl IntoIterator<Item = PeerId>,
+    local_peer: PeerId,
+) -> HashSet<PeerId> {
+    peers
+        .into_iter()
+        .filter(|peer| *peer != local_peer)
+        .collect()
+}
+
+fn dial_discovered_peer<B: NetworkBehaviour>(swarm: &mut Swarm<B>, peer_id: PeerId) {
+    if swarm.is_connected(&peer_id) {
+        return;
+    }
+
+    match swarm.dial(peer_id) {
+        Ok(()) => println!("dialing discovered peer: {peer_id}"),
+        Err(DialError::DialPeerConditionFalse(_)) => {}
+        Err(err) => eprintln!("failed to dial discovered peer {peer_id}: {err}"),
+    }
+}
+
+fn close_failed_heartbeat<B: NetworkBehaviour>(
+    swarm: &mut Swarm<B>,
+    peer: PeerId,
+    connection: ConnectionId,
+    error: &ping::Failure,
+) {
+    eprintln!("heartbeat failed for {peer} on {connection}: {error}; closing connection");
+    if !swarm.close_connection(connection) {
+        eprintln!("heartbeat connection {connection} for {peer} was already closed");
+    }
+}
+
+fn track_connection(
+    connected: &mut HashSet<PeerId>,
+    peers: &mut HashMap<PeerId, PeerConnectionInfo>,
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    address: String,
+) {
+    connected.insert(peer_id);
+    let now = SystemTime::now();
+    let info = peers.entry(peer_id).or_insert_with(|| PeerConnectionInfo {
+        peer_id,
+        connected_since: now,
+        addresses: HashMap::new(),
+        last_heartbeat: now,
+        has_synced: false,
+    });
+    info.addresses.insert(connection_id, address);
+}
+
+fn untrack_connection(
+    connected: &mut HashSet<PeerId>,
+    peers: &mut HashMap<PeerId, PeerConnectionInfo>,
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    remaining: u32,
+) -> bool {
+    if let Some(info) = peers.get_mut(&peer_id) {
+        info.addresses.remove(&connection_id);
+    }
+    if remaining != 0 {
+        return false;
+    }
+    connected.remove(&peer_id);
+    peers.remove(&peer_id);
+    true
 }
 
 fn key_path(base_dir: &Path, listen_port: u16) -> PathBuf {
@@ -632,4 +689,152 @@ pub fn peers_requiring_dial(
         .filter(|peer_id| !connected.contains(*peer_id) && !dialing.contains(*peer_id))
         .copied()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_candidates_follow_live_mdns_addresses_even_if_already_connected() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let other = PeerId::random();
+
+        // mDNS returns a peer once per live address, including connected peers.
+        let discovered = discovered_peer_ids([local, peer, peer, other], local);
+        assert_eq!(discovered, [peer, other].into_iter().collect());
+        // After one of the peer's addresses expires it is still discoverable;
+        // after its last address expires it is no longer a reconnect candidate.
+        let discovered = discovered_peer_ids([peer], local);
+        assert_eq!(discovered, [peer].into_iter().collect());
+        let discovered = discovered_peer_ids([], local);
+        assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn peer_remains_connected_until_its_last_connection_closes() {
+        let peer = PeerId::random();
+        let first = ConnectionId::new_unchecked(1);
+        let second = ConnectionId::new_unchecked(2);
+        let mut connected = HashSet::new();
+        let mut peers = HashMap::new();
+
+        track_connection(&mut connected, &mut peers, peer, first, "first".into());
+        peers.get_mut(&peer).unwrap().has_synced = true;
+        track_connection(&mut connected, &mut peers, peer, second, "second".into());
+        assert!(peers[&peer].has_synced);
+        assert!(!untrack_connection(
+            &mut connected,
+            &mut peers,
+            peer,
+            first,
+            1
+        ));
+        assert!(connected.contains(&peer));
+        assert_eq!(peers[&peer].addresses.get(&second).unwrap(), "second");
+        assert!(untrack_connection(
+            &mut connected,
+            &mut peers,
+            peer,
+            second,
+            0
+        ));
+        assert!(!connected.contains(&peer));
+        assert!(!peers.contains_key(&peer));
+    }
+
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    struct TestBehaviour {
+        keep_alive: KeepAliveBehaviour,
+        ping: ping::Behaviour,
+        sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    }
+
+    fn test_swarm() -> Swarm<TestBehaviour> {
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| TestBehaviour {
+                keep_alive: KeepAliveBehaviour,
+                ping: ping::Behaviour::new(ping::Config::new()),
+                sync: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new(SYNC_PROTOCOL),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+            })
+            .unwrap()
+            .build()
+    }
+
+    #[tokio::test]
+    async fn heartbeat_failure_closes_connection_and_allows_redial() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut first = test_swarm();
+            let mut second = test_swarm();
+            let peer = *second.local_peer_id();
+            second.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+
+            let address = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = second.select_next_some().await {
+                    break address;
+                }
+            };
+            first.add_peer_address(peer, address);
+            dial_discovered_peer(&mut first, peer);
+            // A second discovery while the dial is pending must not poison future attempts.
+            dial_discovered_peer(&mut first, peer);
+
+            let mut connection = None;
+            while connection.is_none() {
+                tokio::select! {
+                    event = first.select_next_some() => {
+                        if let SwarmEvent::ConnectionEstablished { connection_id, .. } = event {
+                            connection = Some(connection_id);
+                        }
+                    }
+                    _ = second.select_next_some() => {}
+                }
+            }
+            // Discovery while already connected must not prevent a later reconnect.
+            dial_discovered_peer(&mut first, peer);
+            close_failed_heartbeat(&mut first, peer, connection.unwrap(), &ping::Failure::Timeout);
+            loop {
+                tokio::select! {
+                    event = first.select_next_some() => {
+                        if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = event {
+                            assert_eq!(peer_id, peer);
+                            assert_eq!(num_established, 0);
+                            break;
+                        }
+                    }
+                    _ = second.select_next_some() => {}
+                }
+            }
+            assert!(!first.is_connected(&peer));
+            dial_discovered_peer(&mut first, peer);
+            loop {
+                tokio::select! {
+                    event = first.select_next_some() => {
+                        if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event {
+                            assert_eq!(peer_id, peer);
+                            break;
+                        }
+                    }
+                    _ = second.select_next_some() => {}
+                }
+            }
+            assert!(first.is_connected(&peer));
+        })
+        .await
+        .expect("local peer should reconnect after a heartbeat failure");
+    }
 }

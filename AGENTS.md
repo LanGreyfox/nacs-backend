@@ -69,7 +69,7 @@
 ✅ Sync Request Timeout: 30 minutes (1800s) for large file transfers
 ✅ Idle Connection Timeout: 5 minutes (300s) to allow slow chunk transfers
 ✅ Max Response Size: 200 MB
-✅ Swarm Idle Timeout: 60 seconds
+✅ Swarm Idle Timeout: 300 seconds
 ✅ Heartbeat: Ping every 10s, timeout 8s
 ✅ Keepalive: custom behaviour keeps connections open despite ping stream keepalive opt-out
 ```
@@ -89,7 +89,7 @@
 - [x] Encrypted P2P transport (Noise + Yamux)
 - [x] P2P identity management and persistence
 - [x] P2P file replication and manifest reconciliation
-- [x] 60s idle timeout with explicit keepalive behaviour
+- [x] 300s idle timeout with explicit keepalive behaviour
 - [x] Heartbeat-based peer reachability checks
 - [x] Integration tests in `tests/db_tests.rs`
 - [x] P2P discovery tests in `tests/p2p_tests.rs`
@@ -169,8 +169,8 @@ pub async fn run_discovery(base_dir: impl AsRef<Path>) -> io::Result<()> {
 - **Idle connection timeout:** 5 minutes (300s) to allow slow chunk transfers
 - **Max response size:** 200 MB
 - **Heartbeat policy:** Ping interval 10s, timeout 8s
-- **Idle policy:** Swarm idle timeout 60s with custom keepalive behaviour
-- **Reconnect policy:** New discoveries are dialed immediately; every 5 seconds, still-discovered peers that are neither connected nor already dialing are retried. Expired mDNS peers are removed from reconnect candidates.
+- **Idle policy:** Swarm idle timeout 300s with custom keepalive behaviour
+- **Reconnect policy:** New discoveries are dialed immediately; every 5 seconds, peers with at least one valid mDNS address that are neither connected nor already dialing are retried. mDNS queries run approximately every 15 seconds, and local advertisements use a 60-second record TTL. Heartbeat failures close the affected connection; a peer is disconnected only when its last connection closes.
 - **Retry logic:** Up to 3 retries per transfer on checksum mismatch or failure before moving to next queued file
 
 ---

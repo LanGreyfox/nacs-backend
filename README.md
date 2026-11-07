@@ -135,8 +135,9 @@ Each stored record includes the current folder, whether the resource is a file o
 - Discovery uses mDNS on the local network.
 - Transport uses TCP with Noise encryption and Yamux multiplexing.
 - The transport is encrypted, but peers are not yet mutually authenticated.
-- Swarm idle timeout is set to 60 seconds.
+- Swarm idle timeout is set to 300 seconds.
 - Ping heartbeat runs every 10 seconds with an 8-second timeout.
+- mDNS queries run approximately every 15 seconds; local advertisements use a 60-second record TTL. Remote peers can advertise a different TTL.
 - A custom keepalive behaviour is enabled so established connections stay open even though ping streams are excluded from keepalive in this libp2p version.
 
 ## P2P sync
@@ -152,10 +153,10 @@ This keeps the sync path bounded in memory and avoids eager pushes of file bytes
 
 Current failure/reconnect semantics:
 
-- On heartbeat failure, the peer is removed from active peer tracking immediately.
-- Discovered peers remain eligible for reconnect attempts while mDNS continues to report them.
+- On heartbeat failure, the affected connection is closed. A peer remains active while another connection to it is open; transfers are canceled only when its last connection closes.
+- Discovered peers remain eligible for reconnect attempts while at least one of their mDNS addresses remains valid, even if discovery happened while they were already connected.
 - Every 5 seconds, the node retries peers that are discovered but neither connected nor already being dialed. A new mDNS discovery also starts an immediate dial attempt.
-- When mDNS reports a peer as expired, it is removed from the reconnect candidates; it can be dialed again if it is discovered later.
+- When all mDNS addresses for a peer expire, it is removed from the reconnect candidates; it can be dialed again if it is discovered later.
 - Active transfers retry up to 3 times on checksum mismatch or failure before moving to the next queued file.
 
 ## Build & Run

@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tracing` 0.1 → 0.1.44
   - `tower` (dev-dependency) 0.5 → 0.5.3
 - Migrated the REST API 404 fallback route to the axum 0.8 path syntax (`/api/{*rest}` instead of `/api/*rest`).
+- Reduced the mDNS query interval to approximately 15 seconds and the local advertisement TTL to 60 seconds for faster peer rediscovery.
+
+### Fixed
+
+- Corrected reconnect handling for peers discovered while connected and peers with multiple mDNS addresses.
+- Close the affected connection on heartbeat failure and keep peers active until their last connection closes.
+- Resume the next queued file transfer for its correct peer when a disconnected peer's transfers are canceled.
 
 ### Removed
 
