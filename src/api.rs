@@ -377,7 +377,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/peers", get(peers_handler))
         .route("/api/v1/files", get(files_handler))
-        .route("/api/*rest", get(api_not_found))
+        .route("/api/{*rest}", get(api_not_found))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(Arc::new(state))
