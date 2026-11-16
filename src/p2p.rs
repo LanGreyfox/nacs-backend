@@ -102,13 +102,21 @@ enum BackgroundResult {
     },
 }
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-struct DiscoveryBehaviour {
-    keep_alive: KeepAliveBehaviour,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    ping: ping::Behaviour,
-    sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+// The libp2p derive forwards uninhabited handler events in generated code.
+#[allow(unreachable_code)]
+mod discovery_behaviour {
+    use super::*;
+
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    pub(super) struct DiscoveryBehaviour {
+        pub(super) keep_alive: KeepAliveBehaviour,
+        pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(super) ping: ping::Behaviour,
+        pub(super) sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    }
 }
+
+use discovery_behaviour::{DiscoveryBehaviour, DiscoveryBehaviourEvent};
 
 // Ping streams are intentionally ignored for keep-alive.
 // This no-op behaviour keeps established connections alive while ping still
@@ -146,7 +154,7 @@ impl NetworkBehaviour for KeepAliveBehaviour {
         _: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
-        libp2p::core::util::unreachable(event)
+        match event {}
     }
 
     fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
@@ -176,7 +184,7 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
-        libp2p::core::util::unreachable(event)
+        match event {}
     }
 
     fn poll(
@@ -195,13 +203,13 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
                 protocol, ..
-            }) => libp2p::core::util::unreachable(protocol),
+            }) => match protocol {},
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol, ..
-            }) => libp2p::core::util::unreachable(protocol),
+            }) => match protocol {},
             ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => match error {
                 StreamUpgradeError::Timeout => unreachable!(),
-                StreamUpgradeError::Apply(e) => libp2p::core::util::unreachable(e),
+                StreamUpgradeError::Apply(e) => match e {},
                 StreamUpgradeError::NegotiationFailed | StreamUpgradeError::Io(_) => {
                     unreachable!("Denied upgrade does not support any protocols")
                 }
@@ -842,12 +850,19 @@ mod tests {
         assert!(!peers.contains_key(&peer));
     }
 
-    #[derive(libp2p::swarm::NetworkBehaviour)]
-    struct TestBehaviour {
-        keep_alive: KeepAliveBehaviour,
-        ping: ping::Behaviour,
-        sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    #[allow(unreachable_code)]
+    mod test_behaviour {
+        use super::*;
+
+        #[derive(libp2p::swarm::NetworkBehaviour)]
+        pub(super) struct TestBehaviour {
+            pub(super) keep_alive: KeepAliveBehaviour,
+            pub(super) ping: ping::Behaviour,
+            pub(super) sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+        }
     }
+
+    use test_behaviour::{TestBehaviour, TestBehaviourEvent};
 
     fn test_swarm() -> Swarm<TestBehaviour> {
         SwarmBuilder::with_new_identity()
