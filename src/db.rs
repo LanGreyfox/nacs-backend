@@ -3,15 +3,23 @@ use std::{
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crc32fast::Hasher;
 use rusqlite::{Connection, OptionalExtension, params};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 const DB_FILENAME: &str = "webdav.db";
+pub(crate) static CHECKSUM_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static ASYNC_CHECKSUM_LIMIT: Semaphore = Semaphore::const_new(1);
+#[cfg(test)]
+pub(crate) static CHECKSUM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
@@ -180,6 +188,9 @@ fn run_worker(
                 }
             }
             Command::Manifest(reply_tx) => {
+                if reply_tx.is_closed() {
+                    continue;
+                }
                 let result = build_manifest(&conn, &data_dir).map_err(|err| err.to_string());
                 let _ = reply_tx.send(result);
             }
@@ -749,6 +760,28 @@ pub(crate) fn file_checksum_and_size(
     data_dir: &Path,
     webdav_path: &str,
 ) -> io::Result<Option<(String, u64)>> {
+    checksum_and_size(data_dir, webdav_path, None)
+}
+
+fn checksum_and_size(
+    data_dir: &Path,
+    webdav_path: &str,
+    cancelled: Option<&AtomicBool>,
+) -> io::Result<Option<(String, u64)>> {
+    let _guard = CHECKSUM_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("checksum worker lock poisoned"))?;
+    let check_cancelled = || {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "checksum cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     let decoded = percent_decode_lossy(webdav_path);
     let rel = decoded.trim_start_matches('/');
     let fs_path = data_dir.join(rel);
@@ -758,6 +791,7 @@ pub(crate) fn file_checksum_and_size(
     let mut size: u64 = 0;
 
     loop {
+        check_cancelled()?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -767,6 +801,42 @@ pub(crate) fn file_checksum_and_size(
     }
 
     Ok(Some((format!("{:08x}", hasher.finalize()), size)))
+}
+
+struct CancelChecksum(Arc<AtomicBool>);
+
+impl Drop for CancelChecksum {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) async fn async_file_checksum_and_size(
+    data_dir: PathBuf,
+    webdav_path: String,
+) -> io::Result<Option<(String, u64)>> {
+    let queued_at = Instant::now();
+    let permit = ASYNC_CHECKSUM_LIMIT
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("checksum worker unavailable"))?;
+    let cancellation = CancelChecksum(Arc::new(AtomicBool::new(false)));
+    let cancelled = cancellation.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let started_at = Instant::now();
+        let result = checksum_and_size(&data_dir, &webdav_path, Some(&cancelled));
+        if queued_at.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "checksum: {webdav_path}: total {:?}, worker {:?}",
+                queued_at.elapsed(),
+                started_at.elapsed()
+            );
+        }
+        result
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("checksum worker failed: {err}")))?
 }
 
 fn normalize_path(path: &str) -> String {

@@ -276,12 +276,7 @@ async fn files_handler(
     let mut tombstones: Vec<TombstoneResponse> = manifest
         .tombstones
         .into_iter()
-        .filter(|t| {
-            if !path_prefix.is_empty() && !t.resource_path.starts_with(path_prefix) {
-                return false;
-            }
-            true
-        })
+        .filter(|t| t.resource_path.starts_with(path_prefix))
         .map(|t| TombstoneResponse {
             path: t.resource_path,
             deleted_at: parse_timestamp(&t.deleted_at),

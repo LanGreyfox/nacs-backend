@@ -474,6 +474,71 @@ async fn fetch_request_returns_not_found_for_missing_file() {
 }
 
 #[tokio::test]
+async fn fetch_request_rechecks_a_replaced_file_with_the_same_size() {
+    let data_dir = temp_dir("sync-fetch-changed-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(data_dir.join("test.txt"), b"first").unwrap();
+
+    let first = handle_fetch_request(&data_dir, "/test.txt").await;
+    fs::write(data_dir.join("test.txt"), b"other").unwrap();
+    let second = handle_fetch_request(&data_dir, "/test.txt").await;
+
+    assert!(
+        matches!(first, SyncResponse::FileStart { checksum, .. } if checksum == crc32_hex(b"first"))
+    );
+    assert!(
+        matches!(second, SyncResponse::FileStart { checksum, .. } if checksum == crc32_hex(b"other"))
+    );
+    fs::remove_dir_all(&data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn incomplete_last_chunk_is_retried_without_publishing_file() {
+    let sqlite_dir = temp_dir("sync-short-chunk-sqlite");
+    let data_dir = temp_dir("sync-short-chunk-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let database = Database::open(&sqlite_dir, &data_dir).await.unwrap();
+    let peer = PeerId::random();
+    let mut state = SyncState::new();
+    state.start_pull(
+        &data_dir,
+        peer,
+        "/short.txt".into(),
+        None,
+        EventKind::Created,
+        "peer".into(),
+    );
+    handle_file_start(
+        &data_dir,
+        &database,
+        &mut state,
+        peer,
+        "/short.txt".into(),
+        5,
+        crc32_hex(b"hi"),
+    )
+    .await
+    .unwrap();
+
+    let next = handle_file_chunk(
+        &data_dir,
+        &database,
+        &mut state,
+        "/short.txt".into(),
+        b"hi".to_vec(),
+        0,
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(next, Some(SyncRequest::FetchFile { .. })));
+    assert!(!data_dir.join("short.txt").exists());
+    fs::remove_dir_all(&sqlite_dir).unwrap();
+    fs::remove_dir_all(&data_dir).unwrap();
+}
+
+#[tokio::test]
 async fn handle_file_start_and_chunk_writes_file_and_verifies_checksum() {
     let sqlite_dir = temp_dir("sync-file-response-sqlite");
     let data_dir = temp_dir("sync-file-response-data");

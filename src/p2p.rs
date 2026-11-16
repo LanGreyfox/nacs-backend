@@ -17,7 +17,7 @@ use libp2p::{
         ConnectionDenied, ConnectionError, ConnectionHandler, ConnectionHandlerEvent, ConnectionId,
         DialError, StreamUpgradeError, SubstreamProtocol, Swarm, SwarmEvent, THandler,
         THandlerInEvent, THandlerOutEvent,
-        behaviour::{FromSwarm, NetworkBehaviour, ToSwarm},
+        behaviour::{FromSwarm, NetworkBehaviour, ToSwarm, toggle::Toggle},
         handler::{
             ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
         },
@@ -26,7 +26,7 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::db::Database;
+use crate::db::{Database, Manifest};
 use crate::sync::{self, FileChangeEvent, SyncRequest, SyncResponse, SyncState};
 
 /// Query types for the P2P worker to expose status to the REST API.
@@ -85,14 +85,38 @@ const SYNC_REQUEST_TIMEOUT_SECS: u64 = 1800; // 30 minutes for large file transf
 const SYNC_PROTOCOL: &str = "/nacs-backend/sync/1";
 // Response size limit: allow large files (200 MB for chunked transfers)
 const SYNC_RESPONSE_SIZE_MAXIMUM: u64 = 200 * 1024 * 1024;
+const MAX_BACKGROUND_REQUESTS: usize = 32;
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-struct DiscoveryBehaviour {
-    keep_alive: KeepAliveBehaviour,
-    mdns: mdns::tokio::Behaviour,
-    ping: ping::Behaviour,
-    sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+enum BackgroundResult {
+    Response {
+        peer: PeerId,
+        request_id: request_response::InboundRequestId,
+        channel: request_response::ResponseChannel<SyncResponse>,
+        response: io::Result<SyncResponse>,
+    },
+    Reconcile {
+        peer: PeerId,
+        connection: ConnectionId,
+        remote: Manifest,
+        local: io::Result<Manifest>,
+    },
 }
+
+// The libp2p derive forwards uninhabited handler events in generated code.
+#[allow(unreachable_code)]
+mod discovery_behaviour {
+    use super::*;
+
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    pub(super) struct DiscoveryBehaviour {
+        pub(super) keep_alive: KeepAliveBehaviour,
+        pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(super) ping: ping::Behaviour,
+        pub(super) sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    }
+}
+
+use discovery_behaviour::{DiscoveryBehaviour, DiscoveryBehaviourEvent};
 
 // Ping streams are intentionally ignored for keep-alive.
 // This no-op behaviour keeps established connections alive while ping still
@@ -130,7 +154,7 @@ impl NetworkBehaviour for KeepAliveBehaviour {
         _: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
-        libp2p::core::util::unreachable(event)
+        match event {}
     }
 
     fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
@@ -160,7 +184,7 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
-        libp2p::core::util::unreachable(event)
+        match event {}
     }
 
     fn poll(
@@ -179,13 +203,13 @@ impl ConnectionHandler for KeepAliveConnectionHandler {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
                 protocol, ..
-            }) => libp2p::core::util::unreachable(protocol),
+            }) => match protocol {},
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol, ..
-            }) => libp2p::core::util::unreachable(protocol),
+            }) => match protocol {},
             ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => match error {
                 StreamUpgradeError::Timeout => unreachable!(),
-                StreamUpgradeError::Apply(e) => libp2p::core::util::unreachable(e),
+                StreamUpgradeError::Apply(e) => match e {},
                 StreamUpgradeError::NegotiationFailed | StreamUpgradeError::Io(_) => {
                     unreachable!("Denied upgrade does not support any protocols")
                 }
@@ -203,8 +227,8 @@ pub async fn run_discovery(
     base_dir: impl AsRef<Path>,
     data_dir: impl AsRef<Path>,
     database: Database,
-    mut announce_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
-    mut query_rx: mpsc::Receiver<P2pQuery>,
+    announce_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
+    query_rx: mpsc::Receiver<P2pQuery>,
 ) -> io::Result<()> {
     let data_dir = data_dir.as_ref().to_path_buf();
     let listen_port = configured_peer_port()?;
@@ -215,7 +239,23 @@ pub async fn run_discovery(
     println!("p2p node started: {local_peer_id}");
     println!("sync: configured CBOR response limit = {SYNC_RESPONSE_SIZE_MAXIMUM} bytes");
 
-    let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+    let mut swarm = build_discovery_swarm(local_key, true)?;
+    swarm
+        .listen_on(
+            format!("/ip4/0.0.0.0/tcp/{listen_port}")
+                .parse()
+                .map_err(io::Error::other)?,
+        )
+        .map_err(io::Error::other)?;
+
+    run_swarm(swarm, data_dir, database, announce_rx, query_rx).await
+}
+
+fn build_discovery_swarm(
+    local_key: identity::Keypair,
+    enable_mdns: bool,
+) -> io::Result<Swarm<DiscoveryBehaviour>> {
+    let swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -226,15 +266,21 @@ pub async fn run_discovery(
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
             let keep_alive = KeepAliveBehaviour;
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config {
-                    query_interval: Duration::from_secs(MDNS_QUERY_INTERVAL_SECS),
-                    ttl: Duration::from_secs(MDNS_TTL_SECS),
-                    ..Default::default()
-                },
-                peer_id,
-            )
-            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
+            let mdns = if enable_mdns {
+                Some(
+                    mdns::tokio::Behaviour::new(
+                        mdns::Config {
+                            query_interval: Duration::from_secs(MDNS_QUERY_INTERVAL_SECS),
+                            ttl: Duration::from_secs(MDNS_TTL_SECS),
+                            ..Default::default()
+                        },
+                        peer_id,
+                    )
+                    .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?,
+                )
+            } else {
+                None
+            };
             let ping = ping::Behaviour::new(
                 ping::Config::new()
                     .with_interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
@@ -253,7 +299,7 @@ pub async fn run_discovery(
 
             Ok(DiscoveryBehaviour {
                 keep_alive,
-                mdns,
+                mdns: mdns.into(),
                 ping,
                 sync,
             })
@@ -264,25 +310,76 @@ pub async fn run_discovery(
         })
         .build();
 
-    swarm
-        .listen_on(
-            format!("/ip4/0.0.0.0/tcp/{listen_port}")
-                .parse()
-                .map_err(io::Error::other)?,
-        )
-        .map_err(io::Error::other)?;
+    Ok(swarm)
+}
 
+async fn run_swarm(
+    mut swarm: Swarm<DiscoveryBehaviour>,
+    data_dir: PathBuf,
+    database: Database,
+    mut announce_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
+    mut query_rx: mpsc::Receiver<P2pQuery>,
+) -> io::Result<()> {
+    let local_peer_id = *swarm.local_peer_id();
     let mut connected_peers = HashSet::new();
     let mut sync_state = SyncState::new();
     let mut peer_info: HashMap<PeerId, PeerConnectionInfo> = HashMap::new();
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut background = tokio::task::JoinSet::new();
+    let mut inbound_jobs = HashMap::new();
 
     loop {
         tokio::select! {
+            Some(result) = background.join_next(), if !background.is_empty() => {
+                match result {
+                    Ok(BackgroundResult::Response { peer, request_id, channel, response }) => {
+                        inbound_jobs.remove(&request_id);
+                        match response {
+                            Ok(response) => {
+                                let is_manifest = matches!(response, SyncResponse::Manifest(_));
+                                if swarm.behaviour_mut().sync.send_response(channel, response).is_err() {
+                                    eprintln!("sync: response channel closed for {peer} ({request_id})");
+                                } else if is_manifest && let Some(info) = peer_info.get_mut(&peer) {
+                                    info.has_synced = true;
+                                }
+                            }
+                            Err(err) => eprintln!("sync: request preparation failed for {peer} ({request_id}): {err}"),
+                        }
+                    }
+                    Ok(BackgroundResult::Reconcile { peer, connection, remote, local }) => {
+                        if !peer_info.get(&peer).is_some_and(|info| info.addresses.contains_key(&connection)) {
+                            continue;
+                        }
+                        match local {
+                            Ok(local) => {
+                                if let Some(info) = peer_info.get_mut(&peer) {
+                                    info.has_synced = true;
+                                }
+                                let actions = sync::diff_manifests(&local, &remote);
+                                let requests = sync::apply_manifest_actions(
+                                    &data_dir, &database, &mut sync_state, peer, actions,
+                                ).await;
+                                for request in requests {
+                                    swarm.behaviour_mut().sync.send_request(&peer, request);
+                                }
+                            }
+                            Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
+                        }
+                    }
+                    Err(err) => {
+                        inbound_jobs.retain(|_, (_, handle): &mut (PeerId, tokio::task::AbortHandle)| !handle.is_finished());
+                        if !err.is_cancelled() {
+                            eprintln!("sync: background task failed: {err}");
+                        }
+                    }
+                }
+            }
             _ = reconnect_interval.tick() => {
-                let discovered = discovered_peer_ids(swarm.behaviour().mdns.discovered_nodes().copied(), local_peer_id);
-                for peer_id in discovered {
-                    dial_discovered_peer(&mut swarm, peer_id);
+                if let Some(mdns) = swarm.behaviour().mdns.as_ref() {
+                    let discovered = discovered_peer_ids(mdns.discovered_nodes().copied(), local_peer_id);
+                    for peer_id in discovered {
+                        dial_discovered_peer(&mut swarm, peer_id);
+                    }
                 }
             }
             event = swarm.select_next_some() => {
@@ -321,27 +418,34 @@ pub async fn run_discovery(
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::Message {
                         peer,
+                        connection_id,
                         message,
                         ..
                     })) => match message {
-                        request_response::Message::Request { request, channel, .. } => match request {
+                        request_response::Message::Request { request_id, request, channel, .. } => match request {
                             SyncRequest::Manifest => {
-                                // Mark peer as synced when they request our manifest
-                                if let Some(info) = peer_info.get_mut(&peer) {
-                                    info.has_synced = true;
+                                if background.len() >= MAX_BACKGROUND_REQUESTS {
+                                    eprintln!("sync: too many pending requests; dropping manifest request from {peer}");
+                                    continue;
                                 }
-                                let response = match database.manifest().await {
-                                    Ok(manifest) => SyncResponse::Manifest(manifest),
-                                    Err(err) => {
-                                        eprintln!("failed to build manifest for {peer}: {err}");
-                                        SyncResponse::Manifest(Default::default())
-                                    }
-                                };
-                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                                let database = database.clone();
+                                let handle = background.spawn(async move {
+                                    let response = database.manifest().await.map(SyncResponse::Manifest);
+                                    BackgroundResult::Response { peer, request_id, channel, response }
+                                });
+                                inbound_jobs.insert(request_id, (peer, handle));
                             }
                             SyncRequest::FetchFile { path } => {
-                                let response = sync::handle_fetch_request(&data_dir, &path).await;
-                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                                if background.len() >= MAX_BACKGROUND_REQUESTS {
+                                    eprintln!("sync: too many pending requests; dropping fetch request from {peer} for {path}");
+                                    continue;
+                                }
+                                let data_dir = data_dir.clone();
+                                let handle = background.spawn(async move {
+                                    let response = sync::handle_fetch_request(&data_dir, &path).await;
+                                    BackgroundResult::Response { peer, request_id, channel, response: Ok(response) }
+                                });
+                                inbound_jobs.insert(request_id, (peer, handle));
                             }
                             SyncRequest::FetchFileChunk { path, offset } => {
                                 let response = sync::handle_fetch_chunk(&data_dir, &path, offset).await;
@@ -361,27 +465,17 @@ pub async fn run_discovery(
                             }
                         },
                         request_response::Message::Response { response, .. } => match response {
-                            SyncResponse::Manifest(remote_manifest) => match database.manifest().await {
-                                Ok(local_manifest) => {
-                                    // Mark peer as synced after successful manifest exchange
-                                    if let Some(info) = peer_info.get_mut(&peer) {
-                                        info.has_synced = true;
-                                    }
-                                    let actions = sync::diff_manifests(&local_manifest, &remote_manifest);
-                                    let fetch_requests = sync::apply_manifest_actions(
-                                        &data_dir,
-                                        &database,
-                                        &mut sync_state,
-                                        peer,
-                                        actions,
-                                    )
-                                    .await;
-                                    for req in fetch_requests {
-                                        let _ = swarm.behaviour_mut().sync.send_request(&peer, req);
-                                    }
+                            SyncResponse::Manifest(remote) => {
+                                if background.len() >= MAX_BACKGROUND_REQUESTS {
+                                    eprintln!("sync: too many pending requests; cannot reconcile manifest from {peer}");
+                                    continue;
                                 }
-                                Err(err) => eprintln!("failed to read local manifest for reconciliation with {peer}: {err}"),
-                            },
+                                let database = database.clone();
+                                background.spawn(async move {
+                                    let local = database.manifest().await;
+                                    BackgroundResult::Reconcile { peer, connection: connection_id, remote, local }
+                                });
+                            }
                             SyncResponse::FileStart { path, total_size, checksum } => {
                                 if let Ok(Some(next_request)) = sync::handle_file_start(
                                     &data_dir,
@@ -438,9 +532,13 @@ pub async fn run_discovery(
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::InboundFailure {
                         peer,
+                        request_id,
                         error,
                         ..
                     })) => {
+                        if let Some((_, handle)) = inbound_jobs.remove(&request_id) {
+                            handle.abort();
+                        }
                         eprintln!("inbound sync request from {peer} failed: {error}");
                     }
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Sync(request_response::Event::ResponseSent { .. })) => {},
@@ -452,6 +550,14 @@ pub async fn run_discovery(
                         ..
                     } => {
                         if untrack_connection(&mut connected_peers, &mut peer_info, peer_id, connection_id, num_established) {
+                            inbound_jobs.retain(|_, (peer, handle)| {
+                                if *peer == peer_id {
+                                    handle.abort();
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                             match sync_state.cancel_peer(peer_id).await {
                                 Ok(Some(request)) => {
                                     if let Some(transfer_peer) = sync_state.current_transfer_peer() {
@@ -744,12 +850,19 @@ mod tests {
         assert!(!peers.contains_key(&peer));
     }
 
-    #[derive(libp2p::swarm::NetworkBehaviour)]
-    struct TestBehaviour {
-        keep_alive: KeepAliveBehaviour,
-        ping: ping::Behaviour,
-        sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    #[allow(unreachable_code)]
+    mod test_behaviour {
+        use super::*;
+
+        #[derive(libp2p::swarm::NetworkBehaviour)]
+        pub(super) struct TestBehaviour {
+            pub(super) keep_alive: KeepAliveBehaviour,
+            pub(super) ping: ping::Behaviour,
+            pub(super) sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+        }
     }
+
+    use test_behaviour::{TestBehaviour, TestBehaviourEvent};
 
     fn test_swarm() -> Swarm<TestBehaviour> {
         SwarmBuilder::with_new_identity()
@@ -836,5 +949,207 @@ mod tests {
         })
         .await
         .expect("local peer should reconnect after a heartbeat failure");
+    }
+
+    #[tokio::test]
+    async fn pending_checksum_does_not_block_status_or_other_requests() {
+        use crate::db::{ASYNC_CHECKSUM_LIMIT, CHECKSUM_LOCK, CHECKSUM_TEST_LOCK};
+
+        let _test_guard = CHECKSUM_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir().join(format!(
+            "nacs-p2p-responsive-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = base.join("data");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::write(data_dir.join("file.txt"), b"hello")
+            .await
+            .unwrap();
+        let database = Database::open(base.join("sqlite"), &data_dir)
+            .await
+            .unwrap();
+
+        let mut server =
+            build_discovery_swarm(identity::Keypair::generate_ed25519(), false).unwrap();
+        server
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let address = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = server.select_next_some().await {
+                break address;
+            }
+        };
+        let server_peer = *server.local_peer_id();
+        let (_announce_tx, announce_rx) = mpsc::unbounded_channel();
+        let (query_tx, query_rx) = mpsc::channel(32);
+        let server_task = tokio::spawn(run_swarm(
+            server,
+            data_dir.clone(),
+            database,
+            announce_rx,
+            query_rx,
+        ));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = CHECKSUM_LOCK.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut client = test_swarm();
+            client.dial(address).unwrap();
+            loop {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } =
+                    client.select_next_some().await
+                    && peer_id == server_peer
+                {
+                    break;
+                }
+            }
+            let fetch_id = client.behaviour_mut().sync.send_request(
+                &server_peer,
+                SyncRequest::FetchFile {
+                    path: "/file.txt".into(),
+                },
+            );
+            loop {
+                tokio::select! {
+                    _ = client.select_next_some() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if ASYNC_CHECKSUM_LIMIT.available_permits() == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let manifest_id = client
+                .behaviour_mut()
+                .sync
+                .send_request(&server_peer, SyncRequest::Manifest);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            query_tx.send(P2pQuery::GetStatus(reply_tx)).await.unwrap();
+            let status = reply_rx.await.unwrap();
+            assert_eq!(status.peers_connected, 1);
+
+            let chunk_id = client.behaviour_mut().sync.send_request(
+                &server_peer,
+                SyncRequest::FetchFileChunk {
+                    path: "/file.txt".into(),
+                    offset: 0,
+                },
+            );
+            loop {
+                if let SwarmEvent::Behaviour(TestBehaviourEvent::Sync(
+                    request_response::Event::Message {
+                        message:
+                            request_response::Message::Response {
+                                request_id,
+                                response,
+                                ..
+                            },
+                        ..
+                    },
+                )) = client.select_next_some().await
+                    && request_id == chunk_id
+                {
+                    assert!(
+                        matches!(response, SyncResponse::FileChunk { data, .. } if data == b"hello")
+                    );
+                    break;
+                }
+            }
+
+            release_tx.send(()).unwrap();
+            lock_thread.join().unwrap();
+            let mut fetch_received = false;
+            let mut manifest_received = false;
+            while !fetch_received || !manifest_received {
+                if let SwarmEvent::Behaviour(TestBehaviourEvent::Sync(
+                    request_response::Event::Message {
+                        message:
+                            request_response::Message::Response {
+                                request_id,
+                                response,
+                                ..
+                            },
+                        ..
+                    },
+                )) = client.select_next_some().await
+                {
+                    if request_id == fetch_id {
+                        assert!(matches!(
+                            response,
+                            SyncResponse::FileStart { total_size: 5, .. }
+                        ));
+                        fetch_received = true;
+                    } else if request_id == manifest_id {
+                        assert!(matches!(response, SyncResponse::Manifest(_)));
+                        manifest_received = true;
+                    }
+                }
+            }
+
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let lock_thread = std::thread::spawn(move || {
+                let _guard = CHECKSUM_LOCK.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            locked_rx.recv().unwrap();
+            client.behaviour_mut().sync.send_request(
+                &server_peer,
+                SyncRequest::FetchFile {
+                    path: "/file.txt".into(),
+                },
+            );
+            loop {
+                tokio::select! {
+                    _ = client.select_next_some() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if ASYNC_CHECKSUM_LIMIT.available_permits() == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            client.disconnect_peer_id(server_peer).unwrap();
+            loop {
+                if let SwarmEvent::ConnectionClosed { peer_id, .. } =
+                    client.select_next_some().await
+                    && peer_id == server_peer
+                {
+                    break;
+                }
+            }
+            loop {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                query_tx.send(P2pQuery::GetStatus(reply_tx)).await.unwrap();
+                if reply_rx.await.unwrap().peers_connected == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            release_tx.send(()).unwrap();
+            lock_thread.join().unwrap();
+            while ASYNC_CHECKSUM_LIMIT.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        server_task.abort();
+        let _ = server_task.await;
+        tokio::fs::remove_dir_all(&base).await.unwrap();
+        result.expect("status and another P2P request should complete while hashing is blocked");
     }
 }
