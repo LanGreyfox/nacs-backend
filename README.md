@@ -151,6 +151,16 @@ Each stored record includes the current folder, whether the resource is a file o
 
 This keeps the sync path bounded in memory and avoids eager pushes of file bytes.
 
+File and manifest preparation runs separately from the P2P event loop, so
+heartbeat and status requests can continue while preparation is in progress.
+CRC32 calculations are limited to one at a time across WebDAV announcements,
+file requests, and database scans. WebDAV change notifications are processed
+in order through a bounded queue; when the queue is full, further WebDAV
+changes wait for space. The sender still reads a file again when a peer
+requests it: a stored checksum cannot safely prove that an externally
+modifiable file has not changed. Checksum operations taking at least one
+second log their total and worker durations.
+
 Current failure/reconnect semantics:
 
 - On heartbeat failure, the affected connection is closed. A peer remains active while another connection to it is open; transfers are canceled only when its last connection closes.

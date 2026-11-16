@@ -17,7 +17,7 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::db::{Database, EventEnvelope, EventKind, Manifest};
+use crate::db::{Database, EventEnvelope, EventKind, Manifest, async_file_checksum_and_size};
 
 /// Chunk size for streaming large files (4 MiB).
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB chunks for memory-constrained devices
@@ -495,6 +495,16 @@ impl SyncState {
             return Ok(None);
         }
 
+        let end = offset.checked_add(data.len() as u64);
+        if offset != transfer.next_chunk_offset
+            || (data.is_empty() && transfer.total_size != 0)
+            || end.is_none_or(|end| end > transfer.total_size)
+            || end.is_some_and(|end| is_last != (end == transfer.total_size))
+        {
+            eprintln!("sync: invalid chunk for {path} at offset {offset}; retrying");
+            return Ok(self.retry_current());
+        }
+
         // Write chunk to temp file
         use tokio::io::AsyncWriteExt;
         transfer.file.as_mut().unwrap().write_all(&data).await?;
@@ -727,24 +737,6 @@ async fn apply_delete(data_dir: &Path, path: &str) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// Computes CRC32 checksum of a file without loading it entirely into memory.
-async fn compute_checksum(data_dir: &Path, path: &str) -> io::Result<Option<String>> {
-    let fs_path = fs_path_from_wire_path(data_dir, path);
-    let mut file = tokio::fs::File::open(&fs_path).await?;
-    let mut hasher = Hasher::new();
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(Some(format!("{:08x}", hasher.finalize())))
 }
 
 /// Applies an inbound `SyncRequest::Event` push notification.
@@ -1033,19 +1025,29 @@ pub async fn handle_fetch_request(data_dir: &Path, path: &str) -> SyncResponse {
             };
         }
     };
-    let total_size = metadata.len();
+    let (checksum, total_size) =
+        match async_file_checksum_and_size(data_dir.to_path_buf(), path.to_string()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                eprintln!("sync: no checksum available for {path}");
+                return SyncResponse::NotFound {
+                    path: path.to_string(),
+                };
+            }
+            Err(err) => {
+                eprintln!("sync: failed to compute checksum for {}: {}", path, err);
+                return SyncResponse::NotFound {
+                    path: path.to_string(),
+                };
+            }
+        };
 
-    // Compute checksum
-    let checksum = match compute_checksum(data_dir, path).await {
-        Ok(Some(cs)) => cs,
-        Ok(None) => "empty".to_string(),
-        Err(err) => {
-            eprintln!("sync: failed to compute checksum for {}: {}", path, err);
-            return SyncResponse::NotFound {
-                path: path.to_string(),
-            };
-        }
-    };
+    if metadata.len() != total_size {
+        eprintln!("sync: file changed while calculating checksum for {path}");
+        return SyncResponse::NotFound {
+            path: path.to_string(),
+        };
+    }
 
     println!("sync: file start {} ({} bytes)", path, total_size);
     SyncResponse::FileStart {

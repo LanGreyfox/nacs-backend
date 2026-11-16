@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::auth::{build_unauthorized_response, is_authorized, parse_basic_credentials};
-use crate::db::{Database, EventEnvelope, EventKind, file_checksum_and_size};
+use crate::db::{Database, EventEnvelope, EventKind, async_file_checksum_and_size};
 use crate::sync::{FileChangeEvent, P2pHandle};
 use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
 use hyper::header::{AUTHORIZATION, USER_AGENT};
@@ -281,6 +281,10 @@ pub struct SpawnP2pAnnouncementParams {
 
 #[doc(hidden)]
 pub fn spawn_p2p_announcement(params: SpawnP2pAnnouncementParams) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(announce_file_event(params, true))
+}
+
+async fn announce_file_event(params: SpawnP2pAnnouncementParams, should_hash: bool) {
     let SpawnP2pAnnouncementParams {
         event_kind,
         source_path,
@@ -293,31 +297,45 @@ pub fn spawn_p2p_announcement(params: SpawnP2pAnnouncementParams) -> tokio::task
         database,
         p2p,
     } = params;
-    tokio::task::spawn_blocking(move || {
-        let (checksum, size) = match file_checksum_and_size(&data_dir, &final_path) {
+    let (checksum, size) = if should_hash {
+        match async_file_checksum_and_size(data_dir, final_path.clone()).await {
             Ok(Some((checksum, size))) => (Some(checksum), size),
-            Ok(None) | Err(_) => (None, 0),
-        };
+            Ok(None) => (None, 0),
+            Err(err) => {
+                eprintln!("failed to compute checksum for {final_path}: {err}");
+                (None, 0)
+            }
+        }
+    } else {
+        (None, 0)
+    };
 
-        database.record(EventEnvelope {
-            event_kind,
-            source_path: source_path.clone(),
-            destination_path: destination_path.clone(),
-            checksum: checksum.clone(),
-            method,
-            status_code,
-            username: username.clone(),
-        });
+    database.record(EventEnvelope {
+        event_kind,
+        source_path: source_path.clone(),
+        destination_path: destination_path.clone(),
+        checksum: checksum.clone(),
+        method,
+        status_code,
+        username: username.clone(),
+    });
 
-        p2p.announce(FileChangeEvent {
-            event_kind,
-            source_path,
-            destination_path,
-            checksum,
-            size,
-            username,
-        });
-    })
+    p2p.announce(FileChangeEvent {
+        event_kind,
+        source_path,
+        destination_path,
+        checksum,
+        size,
+        username,
+    });
+}
+
+async fn process_file_events(
+    mut event_rx: tokio::sync::mpsc::Receiver<(SpawnP2pAnnouncementParams, bool)>,
+) {
+    while let Some((params, should_hash)) = event_rx.recv().await {
+        announce_file_event(params, should_hash).await;
+    }
 }
 
 pub async fn run_server(
@@ -334,6 +352,8 @@ pub async fn run_server(
 
     let dav_server = build_handler(dir.as_ref());
     let listener = TcpListener::bind(addr).await?;
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(process_file_events(event_rx));
 
     println!("WebDAV listening on http://{addr}");
 
@@ -343,6 +363,7 @@ pub async fn run_server(
         let database = database.clone();
         let p2p = p2p.clone();
         let data_dir = data_dir.clone();
+        let event_tx = event_tx.clone();
         let username = username.clone();
         let password = password.clone();
         let io = TokioIo::new(stream);
@@ -359,6 +380,7 @@ pub async fn run_server(
                             let database = database.clone();
                             let p2p = p2p.clone();
                             let data_dir = data_dir.clone();
+                            let event_tx = event_tx.clone();
                             async move {
                                 let method = req.method().clone();
                                 let uri = req.uri().clone();
@@ -413,40 +435,23 @@ pub async fn run_server(
                                             | EventKind::Copied
                                     );
 
-                                    if should_hash {
-                                        spawn_p2p_announcement(SpawnP2pAnnouncementParams {
-                                            event_kind,
-                                            source_path,
-                                            destination_path: destination.clone(),
-                                            username: username.clone(),
-                                            method: method.as_str().to_string(),
-                                            status_code: status.as_u16(),
-                                            data_dir: data_dir.clone(),
-                                            final_path,
-                                            database: database.clone(),
-                                            p2p: p2p.clone(),
-                                        });
-                                    } else {
-                                        database.record(EventEnvelope {
-                                            event_kind,
-                                            source_path: source_path.clone(),
-                                            destination_path: destination.clone(),
-                                            checksum: None,
-                                            method: method.as_str().to_string(),
-                                            status_code: status.as_u16(),
-                                            username: username.clone(),
-                                        });
-
-                                        p2p.announce(FileChangeEvent {
-                                            event_kind,
-                                            source_path,
-                                            destination_path: destination.clone(),
-                                            checksum: None,
-                                            size: 0,
-                                            username: username.clone(),
-                                        });
+                                    let params = SpawnP2pAnnouncementParams {
+                                        event_kind,
+                                        source_path,
+                                        destination_path: destination.clone(),
+                                        username: username.clone(),
+                                        method: method.as_str().to_string(),
+                                        status_code: status.as_u16(),
+                                        data_dir: data_dir.clone(),
+                                        final_path,
+                                        database: database.clone(),
+                                        p2p: p2p.clone(),
+                                    };
+                                    if event_tx.send((params, should_hash)).await.is_err() {
+                                        eprintln!("webdav event worker stopped; change was not announced");
                                     }
                                 }
+
                                 log_file_event(&event, &method, &uri, status, &user_agent);
 
                                 Ok::<_, Infallible>(response)
@@ -459,5 +464,68 @@ pub async fn run_server(
                 eprintln!("Failed serving: {err:?}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn file_events_are_announced_in_queue_order() {
+        let _test_guard = crate::db::CHECKSUM_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir().join(format!(
+            "nacs-event-order-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = base.join("data");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::write(data_dir.join("file.txt"), b"content")
+            .await
+            .unwrap();
+        let database = Database::open(base.join("sqlite"), &data_dir)
+            .await
+            .unwrap();
+        let (p2p, mut announcements) = P2pHandle::channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let worker = tokio::spawn(process_file_events(rx));
+
+        for (event_kind, should_hash) in [(EventKind::Created, true), (EventKind::Deleted, false)] {
+            tx.send((
+                SpawnP2pAnnouncementParams {
+                    event_kind,
+                    source_path: "/file.txt".into(),
+                    destination_path: None,
+                    username: "user".into(),
+                    method: "test".into(),
+                    status_code: 200,
+                    data_dir: data_dir.clone(),
+                    final_path: "/file.txt".into(),
+                    database: database.clone(),
+                    p2p: p2p.clone(),
+                },
+                should_hash,
+            ))
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        worker.await.unwrap();
+
+        assert_eq!(
+            announcements.recv().await.unwrap().event_kind,
+            EventKind::Created
+        );
+        assert_eq!(
+            announcements.recv().await.unwrap().event_kind,
+            EventKind::Deleted
+        );
+        database.manifest().await.unwrap();
+        tokio::fs::remove_dir_all(&base).await.unwrap();
     }
 }
